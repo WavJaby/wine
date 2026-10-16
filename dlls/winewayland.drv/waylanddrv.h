@@ -136,6 +136,7 @@ struct wayland_pointer
 struct wayland_touch_point
 {
     struct wl_list link;
+    WORD pointer_id;
     LPARAM xy;
     HWND focused_hwnd;
     int32_t id;

@@ -53,8 +53,28 @@ static void wayland_touch_point_to_window(struct wayland_surface *surface,
                                           double surface_x, double surface_y,
                                           double *window_x, double *window_y)
 {
-    *window_x = surface_x * surface->window.scale + surface->window.rect.left;
-    *window_y = surface_y * surface->window.scale + surface->window.rect.top;
+    POINT point = {surface_x, surface_y};
+
+    point = map_point_from_surface(surface, point);
+    *window_x = point.x + surface->window.rect.left;
+    *window_y = point.y + surface->window.rect.top;
+}
+
+/* Pointer id 1 is reserved for the mouse; Wayland ids are a separate namespace. */
+static WORD allocate_pointer_id(void)
+{
+    struct wayland_touch_point *point;
+    unsigned int id;
+    BOOL used;
+
+    for (id = 2; id <= 0xffff; id++)
+    {
+        used = FALSE;
+        wl_list_for_each(point, &process_wayland.touch.touch_points, link)
+            if (point->pointer_id == id) { used = TRUE; break; }
+        if (!used) return id;
+    }
+    return 0;
 }
 
 static void touch_handle_down(void *private, struct wl_touch *wl_touch,
@@ -79,6 +99,11 @@ static void touch_handle_down(void *private, struct wl_touch *wl_touch,
     if (!(surface = data->wayland_surface)) goto err;
     if (!(point = calloc(1, sizeof(*point)))) goto err;
 
+    if (!(point->pointer_id = allocate_pointer_id()))
+    {
+        free(point);
+        goto err;
+    }
     point->id = id;
     point->focused_hwnd = hwnd;
     wl_list_init(&point->link);
@@ -92,7 +117,7 @@ static void touch_handle_down(void *private, struct wl_touch *wl_touch,
 
     input.type = INPUT_HARDWARE;
     input.hi.uMsg = WM_POINTERDOWN;
-    input.hi.wParamL = id;
+    input.hi.wParamL = point->pointer_id;
     input.hi.wParamH = POINTER_MESSAGE_FLAG_INRANGE |
                        POINTER_MESSAGE_FLAG_INCONTACT |
                        POINTER_MESSAGE_FLAG_NEW;
@@ -134,9 +159,8 @@ static void touch_handle_up(void *private, struct wl_touch *wl_touch,
 
     input.type = INPUT_HARDWARE;
     input.hi.uMsg = WM_POINTERUP;
-    input.hi.wParamL = id;
-    input.hi.wParamH = POINTER_MESSAGE_FLAG_INRANGE |
-                       POINTER_MESSAGE_FLAG_INCONTACT;
+    input.hi.wParamL = point->pointer_id;
+    input.hi.wParamH = 0;
 
     TRACE("hwnd=%p id=%d\n", point->focused_hwnd, id);
 
@@ -175,13 +199,13 @@ static void touch_handle_motion(void *private, struct wl_touch *wl_touch,
     point->xy = map_point_vscreen(touch_x, touch_y);
     wayland_win_data_release(data);
 
-    if (old_xy != point->xy) return;
+    if (old_xy == point->xy) return;
 
     TRACE("hwnd=%p pos=(%lf,%lf)\n", point->focused_hwnd, touch_x, touch_y);
 
     input.type = INPUT_HARDWARE;
     input.hi.uMsg = WM_POINTERUPDATE;
-    input.hi.wParamL = id;
+    input.hi.wParamL = point->pointer_id;
     input.hi.wParamH = POINTER_MESSAGE_FLAG_INRANGE |
                        POINTER_MESSAGE_FLAG_INCONTACT;
 
@@ -200,17 +224,26 @@ static void touch_handle_cancel(void *private, struct wl_touch *wl_touch)
 
     input.type = INPUT_HARDWARE;
     input.hi.uMsg = WM_POINTERUP;
-    input.hi.wParamH = POINTER_MESSAGE_FLAG_INRANGE |
-                       POINTER_MESSAGE_FLAG_INCONTACT;
+    input.hi.wParamH = POINTER_MESSAGE_FLAG_CANCELED;
 
     wl_list_for_each_safe(point, next, &touch->touch_points, link)
     {
-        input.hi.wParamL = point->id;
+        input.hi.wParamL = point->pointer_id;
 
         NtUserSendHardwareInput(point->focused_hwnd, 0, &input, point->xy);
         wl_list_remove(&point->link);
         free(point);
     }
+}
+
+static void touch_handle_shape(void *data, struct wl_touch *touch, int32_t id,
+                               wl_fixed_t major, wl_fixed_t minor)
+{
+}
+
+static void touch_handle_orientation(void *data, struct wl_touch *touch, int32_t id,
+                                     wl_fixed_t orientation)
+{
 }
 
 static const struct wl_touch_listener wl_touch_listener = {
@@ -219,6 +252,8 @@ static const struct wl_touch_listener wl_touch_listener = {
     touch_handle_motion,
     touch_handle_frame,
     touch_handle_cancel,
+    touch_handle_shape,
+    touch_handle_orientation,
 };
 
 void wayland_touch_init(struct wl_touch *wl_touch)
@@ -235,6 +270,7 @@ void wayland_touch_deinit(void)
     struct wayland_touch_point *point, *next;
     struct wayland_touch *touch = &process_wayland.touch;
 
+    touch_handle_cancel(NULL, touch->wl_touch);
     wl_touch_release(touch->wl_touch);
     touch->wl_touch = NULL;
     wl_list_for_each_safe(point, next, &touch->touch_points, link)
