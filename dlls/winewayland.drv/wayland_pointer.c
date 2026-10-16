@@ -197,6 +197,7 @@ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
     pthread_mutex_lock(&pointer->mutex);
     pointer->focused_hwnd = hwnd;
     pointer->enter_serial = serial;
+    memset(pointer->scroll, 0, sizeof(pointer->scroll));
     pthread_mutex_unlock(&pointer->mutex);
 
     /* The cursor is undefined at every enter, so we set it again with
@@ -223,6 +224,7 @@ static void pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
     pthread_mutex_lock(&pointer->mutex);
     pointer->focused_hwnd = NULL;
     pointer->enter_serial = 0;
+    memset(pointer->scroll, 0, sizeof(pointer->scroll));
     pthread_mutex_unlock(&pointer->mutex);
 }
 
@@ -270,53 +272,93 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
     NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, 0);
 }
 
+static void pointer_flush_scroll(void)
+{
+    struct wayland_pointer *pointer = &process_wayland.pointer;
+    int deltas[2];
+    HWND hwnd;
+    unsigned int axis;
+
+    pthread_mutex_lock(&pointer->mutex);
+    hwnd = pointer->focused_hwnd;
+    for (axis = 0; axis < ARRAY_SIZE(pointer->scroll); ++axis)
+    {
+        /* Continuous axis units have no universal wheel conversion. Use the
+         * conventional ten surface units per wheel notch, as Qt Wayland does.
+         * Discrete/value120 events take precedence over their paired axis. */
+        double value = pointer->scroll[axis].has_value120 ? pointer->scroll[axis].value120 :
+                       pointer->scroll[axis].value * WHEEL_DELTA / 10.0;
+        value += pointer->scroll[axis].remainder;
+        deltas[axis] = value;
+        pointer->scroll[axis].remainder = pointer->scroll[axis].stopped ? 0.0 : value - deltas[axis];
+        pointer->scroll[axis].value = 0.0;
+        pointer->scroll[axis].value120 = 0;
+        pointer->scroll[axis].has_value120 = FALSE;
+        pointer->scroll[axis].stopped = FALSE;
+    }
+    pthread_mutex_unlock(&pointer->mutex);
+
+    if (!hwnd) return;
+    for (axis = 0; axis < ARRAY_SIZE(deltas); ++axis)
+    {
+        INPUT input = {.type = INPUT_MOUSE};
+        if (!deltas[axis]) continue;
+        input.mi.dwFlags = axis == WL_POINTER_AXIS_VERTICAL_SCROLL ? MOUSEEVENTF_WHEEL : MOUSEEVENTF_HWHEEL;
+        input.mi.mouseData = axis == WL_POINTER_AXIS_VERTICAL_SCROLL ? -deltas[axis] : deltas[axis];
+        TRACE("hwnd=%p axis=%u value120=%d\n", hwnd, axis, deltas[axis]);
+        NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, 0);
+    }
+}
+
 static void pointer_handle_axis(void *data, struct wl_pointer *wl_pointer,
                                 uint32_t time, uint32_t axis, wl_fixed_t value)
 {
+    struct wayland_pointer *pointer = &process_wayland.pointer;
+    if (axis >= ARRAY_SIZE(pointer->scroll)) return;
+    pthread_mutex_lock(&pointer->mutex);
+    pointer->scroll[axis].value += wl_fixed_to_double(value);
+    pthread_mutex_unlock(&pointer->mutex);
+    if (wl_pointer_get_version(wl_pointer) < WL_POINTER_FRAME_SINCE_VERSION) pointer_flush_scroll();
 }
 
 static void pointer_handle_frame(void *data, struct wl_pointer *wl_pointer)
 {
     static const INPUT input = { .type = INPUT_MOUSE, .mi.dwFlags = MOUSEEVENTF_MOVE_NOCOALESCE };
     NtUserSendHardwareInput(NULL, SEND_HWMSG_RAWINPUT, &input, 0); /* flush win32u accumulated motion */
+    pointer_flush_scroll();
 }
 
 static void pointer_handle_axis_source(void *data, struct wl_pointer *wl_pointer,
                                        uint32_t axis_source)
 {
+    struct wayland_pointer *pointer = &process_wayland.pointer;
+    unsigned int axis;
+    pthread_mutex_lock(&pointer->mutex);
+    if (pointer->scroll_source != axis_source)
+        for (axis = 0; axis < ARRAY_SIZE(pointer->scroll); ++axis) pointer->scroll[axis].remainder = 0.0;
+    pointer->scroll_source = axis_source;
+    pthread_mutex_unlock(&pointer->mutex);
 }
 
 static void pointer_handle_axis_stop(void *data, struct wl_pointer *wl_pointer,
                                      uint32_t time, uint32_t axis)
 {
+    struct wayland_pointer *pointer = &process_wayland.pointer;
+    if (axis >= ARRAY_SIZE(pointer->scroll)) return;
+    pthread_mutex_lock(&pointer->mutex);
+    pointer->scroll[axis].stopped = TRUE;
+    pthread_mutex_unlock(&pointer->mutex);
 }
 
 static void pointer_handle_axis_value120(void *data, struct wl_pointer *wl_pointer,
                                          uint32_t axis, int32_t value120)
 {
-    INPUT input = {0};
-    HWND hwnd;
-
-    if (!(hwnd = wayland_pointer_get_focused_hwnd())) return;
-
-    input.type = INPUT_MOUSE;
-
-    switch (axis)
-    {
-    case WL_POINTER_AXIS_VERTICAL_SCROLL:
-        input.mi.dwFlags = MOUSEEVENTF_WHEEL;
-        input.mi.mouseData = -value120;
-        break;
-    case WL_POINTER_AXIS_HORIZONTAL_SCROLL:
-        input.mi.dwFlags = MOUSEEVENTF_HWHEEL;
-        input.mi.mouseData = value120;
-        break;
-    default: break;
-    }
-
-    TRACE("hwnd=%p axis=%u value120=%d\n", hwnd, axis, value120);
-
-    NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, 0);
+    struct wayland_pointer *pointer = &process_wayland.pointer;
+    if (axis >= ARRAY_SIZE(pointer->scroll)) return;
+    pthread_mutex_lock(&pointer->mutex);
+    pointer->scroll[axis].value120 += value120;
+    pointer->scroll[axis].has_value120 = TRUE;
+    pthread_mutex_unlock(&pointer->mutex);
 }
 
 static void pointer_handle_axis_discrete(void *data, struct wl_pointer *wl_pointer,
@@ -414,6 +456,8 @@ void wayland_pointer_init(struct wl_pointer *wl_pointer)
     pointer->wl_pointer = wl_pointer;
     pointer->focused_hwnd = NULL;
     pointer->enter_serial = 0;
+    memset(pointer->scroll, 0, sizeof(pointer->scroll));
+    pointer->scroll_source = WL_POINTER_AXIS_SOURCE_WHEEL;
     pthread_mutex_unlock(&pointer->mutex);
     wl_pointer_add_listener(pointer->wl_pointer, &pointer_listener, NULL);
 
@@ -459,6 +503,7 @@ void wayland_pointer_deinit(void)
     pointer->wl_pointer = NULL;
     pointer->focused_hwnd = NULL;
     pointer->enter_serial = 0;
+    memset(pointer->scroll, 0, sizeof(pointer->scroll));
     pthread_mutex_unlock(&pointer->mutex);
 }
 

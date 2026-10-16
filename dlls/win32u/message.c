@@ -400,7 +400,7 @@ static const unsigned int message_pointer_flags[] =
     /* 0x2c0 - 0x2df */
     0,
     /* 0x2e0 - 0x2ff */
-    0,
+    SET(WM_DPICHANGED) | SET(WM_GETDPISCALEDSIZE),
     /* 0x300 - 0x31f */
     SET(WM_ASKCBFORMATNAME)
 };
@@ -857,6 +857,11 @@ static BOOL unpack_message( HWND hwnd, UINT message, WPARAM *wparam, LPARAM *lpa
         memcpy( *buffer, &mnm, sizeof(mnm) );
         break;
     }
+    case WM_GETDPISCALEDSIZE:
+        minsize = sizeof(SIZE);
+        if (!get_buffer_space( buffer, sizeof(SIZE), buffer_size )) return FALSE;
+        break;
+    case WM_DPICHANGED:
     case WM_SIZING:
     case WM_MOVING:
         minsize = sizeof(RECT);
@@ -1241,6 +1246,12 @@ static size_t pack_message( HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         push_data( data, &data->ps.mnm, sizeof(data->ps.mnm) );
         return sizeof(data->ps.mnm);
     }
+    case WM_GETDPISCALEDSIZE:
+        push_data( data, (SIZE *)lparam, sizeof(SIZE) );
+        return sizeof(SIZE);
+    case WM_DPICHANGED:
+        push_data( data, (RECT *)lparam, sizeof(RECT) );
+        return 0;
     case WM_SIZING:
     case WM_MOVING:
         push_data( data, (RECT *)lparam, sizeof(RECT) );
@@ -1411,6 +1422,9 @@ static void pack_reply( HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
     case SBM_GETSCROLLINFO:
         push_data( data, (SCROLLINFO *)lparam, sizeof(SCROLLINFO) );
         break;
+    case WM_GETDPISCALEDSIZE:
+        push_data( data, (SIZE *)lparam, sizeof(SIZE) );
+        break;
     case EM_GETRECT:
     case LB_GETITEMRECT:
     case CB_GETDROPPEDCONTROLRECT:
@@ -1553,6 +1567,9 @@ static void unpack_reply( HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
         break;
     case SBM_GETSCROLLBARINFO:
         memcpy( (SCROLLBARINFO *)lparam, buffer, min( sizeof(SCROLLBARINFO), size ));
+        break;
+    case WM_GETDPISCALEDSIZE:
+        memcpy( (SIZE *)lparam, buffer, min( sizeof(SIZE), size ));
         break;
     case EM_GETRECT:
     case CB_GETDROPPEDCONTROLRECT:
@@ -1767,6 +1784,10 @@ size_t user_message_size( HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
     case CB_GETEDITSEL:
         size = 2 * sizeof(DWORD);
         break;
+    case WM_GETDPISCALEDSIZE:
+        size = sizeof(SIZE);
+        break;
+    case WM_DPICHANGED:
     case WM_SIZING:
     case WM_MOVING:
     case EM_GETRECT:
@@ -2056,6 +2077,9 @@ static void copy_user_result( void *buffer, size_t size, LRESULT result, UINT me
             if (lparam) *(DWORD *)lparam = ptr[1];
             break;
         }
+    case WM_GETDPISCALEDSIZE:
+        copy_size = sizeof(SIZE);
+        break;
     case WM_SIZING:
     case WM_MOVING:
     case EM_GETRECT:

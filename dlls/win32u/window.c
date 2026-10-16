@@ -4081,6 +4081,63 @@ done:
     return after;
 }
 
+/* Send PMv2 child notifications in the order defined by the window tree. */
+static void notify_child_dpi_changed( HWND hwnd, UINT message )
+{
+    HWND *children = list_window_children( hwnd );
+    unsigned int i;
+
+    if (!children) return;
+    for (i = 0; children[i]; ++i)
+    {
+        if (NtUserGetAncestor( children[i], GA_PARENT ) != hwnd) continue;
+        if (message == WM_DPICHANGED_BEFOREPARENT) notify_child_dpi_changed( children[i], message );
+        send_message( children[i], message, 0, 0 );
+        if (message == WM_DPICHANGED_AFTERPARENT) notify_child_dpi_changed( children[i], message );
+    }
+    free( children );
+}
+
+/* Deliver monitor changes on the owning GUI thread, after committing the position. */
+static void notify_window_dpi_changed( HWND hwnd )
+{
+    struct ratio dpi, old_dpi, raw_dpi;
+    UINT context = get_window_dpi_awareness_context( hwnd ), value;
+    BOOL per_monitor_v2;
+    RECT rect, scaled;
+    SIZE size;
+    WND *win;
+
+    if (!NTUSER_DPI_CONTEXT_IS_MONITOR_AWARE( context ) || !is_current_thread_window( hwnd )) return;
+    if (NtUserGetAncestor( hwnd, GA_PARENT ) != get_desktop_window()) return;
+    dpi = get_win_monitor_dpi( hwnd, &raw_dpi );
+    if (!dpi.num || !dpi.den) return;
+    if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP) return;
+    old_dpi = win->notified_monitor_dpi;
+    win->notified_monitor_dpi = dpi;
+    release_win_ptr( win );
+    if (!old_dpi.num || !old_dpi.den || dpi.num * old_dpi.den == old_dpi.num * dpi.den) return;
+
+    if (!get_window_rect( hwnd, &rect, get_thread_dpi() )) return;
+    value = (dpi.num + dpi.den / 2) / dpi.den;
+    per_monitor_v2 = NTUSER_DPI_CONTEXT_GET_VERSION( context ) == 2;
+    size.cx = rect.right - rect.left;
+    size.cy = rect.bottom - rect.top;
+    if (!per_monitor_v2 || !send_message( hwnd, WM_GETDPISCALEDSIZE, value, (LPARAM)&size ))
+    {
+        SetRect( &scaled, 0, 0, rect.right - rect.left, rect.bottom - rect.top );
+        scaled = map_dpi_rect( scaled, old_dpi, dpi );
+        size.cx = scaled.right;
+        size.cy = scaled.bottom;
+    }
+    rect.right = rect.left + size.cx;
+    rect.bottom = rect.top + size.cy;
+
+    if (per_monitor_v2) notify_child_dpi_changed( hwnd, WM_DPICHANGED_BEFOREPARENT );
+    send_message( hwnd, WM_DPICHANGED, MAKELONG( value, value ), (LPARAM)&rect );
+    if (per_monitor_v2) notify_child_dpi_changed( hwnd, WM_DPICHANGED_AFTERPARENT );
+}
+
 /* NtUserSetWindowPos implementation */
 BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
 {
@@ -4220,6 +4277,7 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
     if ((winpos->flags & (SWP_NOSIZE|SWP_NOMOVE|SWP_FRAMECHANGED)) != (SWP_NOSIZE|SWP_NOMOVE))
         NtUserNotifyWinEvent( EVENT_OBJECT_LOCATIONCHANGE, winpos->hwnd, OBJID_WINDOW, 0 );
 
+    notify_window_dpi_changed( winpos->hwnd );
     ret = TRUE;
 done:
     set_thread_dpi_awareness_context( context );
@@ -4947,6 +5005,7 @@ void update_window_state( HWND hwnd )
     surface = get_window_surface( hwnd, swp_flags, FALSE, &new_rects, &surface_rect );
     apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, valid_rects );
     if (surface) window_surface_release( surface );
+    notify_window_dpi_changed( hwnd );
 
     set_thread_dpi_awareness_context( context );
 }
@@ -5709,12 +5768,6 @@ static WND *create_window_handle( HWND parent, HWND owner, UNICODE_STRING *name,
     struct tagCLASS *class = NULL;
     WND *win;
 
-    if (NTUSER_DPI_CONTEXT_IS_MONITOR_AWARE( dpi_context ) && dpi_context != NTUSER_DPI_PER_MONITOR_AWARE)
-    {
-        FIXME( "DPI context %#x not implemented\n", dpi_context );
-        dpi_context = NTUSER_DPI_PER_MONITOR_AWARE;
-    }
-
     if (!is_desktop_class( name ))
     {
         if (parent && parent != get_desktop_window()) dpi = get_win_monitor_dpi( parent, &raw_dpi );
@@ -5786,6 +5839,7 @@ static WND *create_window_handle( HWND parent, HWND owner, UNICODE_STRING *name,
     win->parent     = full_parent;
     win->owner      = full_owner;
     win->class      = class;
+    win->notified_monitor_dpi = dpi;
     set_user_handle_ptr( handle, win );
     return win;
 }

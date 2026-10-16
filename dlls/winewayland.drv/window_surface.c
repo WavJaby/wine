@@ -341,7 +341,8 @@ static void wayland_shm_buffer_copy(struct wayland_shm_buffer *src,
  *          wayland_shm_buffer_copy_shape
  */
 static void wayland_shm_buffer_copy_shape(struct wayland_shm_buffer *buffer, const RECT *dirty,
-                                          const BITMAPINFO *shape_info, const void *shape_bits)
+                                          const RECT *surface_rect, const BITMAPINFO *shape_info,
+                                          const void *shape_bits)
 {
     RECT dst_rect = {0, 0, buffer->width, buffer->height};
     UINT32 *color, shape_stride, color_stride, x, y;
@@ -352,15 +353,17 @@ static void wayland_shm_buffer_copy_shape(struct wayland_shm_buffer *buffer, con
     color_stride = dst_rect.right - dst_rect.left;
 
     if (!intersect_rect(&rect, &dst_rect, dirty)) return;
+    if (!intersect_rect(&rect, &rect, surface_rect)) return;
 
     color = (UINT32 *)buffer->map_data + rect.top * color_stride;
-    shape = (const BYTE *)shape_bits + rect.top * shape_stride;
+    shape = (const BYTE *)shape_bits + (rect.top - surface_rect->top) * shape_stride;
 
     for (y = rect.top; y < rect.bottom; y++, color += color_stride, shape += shape_stride)
     {
         for (x = rect.left; x < rect.right; x++)
         {
-            if (!(shape[x / 8] & (1 << (7 - (x & 7))))) color[x] = 0;
+            UINT32 shape_x = x - surface_rect->left;
+            if (!(shape[shape_x / 8] & (1 << (7 - (shape_x & 7))))) color[x] = 0;
         }
     }
 }
@@ -374,11 +377,30 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
 {
     RECT surface_rect = {.right = color_info->bmiHeader.biWidth, .bottom = abs(color_info->bmiHeader.biHeight)};
     struct wayland_window_surface *wws = wayland_window_surface_cast(window_surface);
+    struct wayland_win_data *data;
     struct wayland_shm_buffer *shm_buffer = NULL, *latest_buffer;
     BOOL flushed = FALSE;
     HRGN surface_damage_region = NULL;
     HRGN copy_from_window_region;
     uint32_t buffer_format;
+    int width, height;
+
+    /* GDI surfaces may be clipped or rounded beyond the visible window.
+     * Keep their pixels in window coordinates, but expose exactly the window
+     * extent. Bitmap alignment pixels can otherwise bleed across a fractional
+     * viewport's right/bottom edge. Pad only when the GDI contents are clipped. */
+    OffsetRect(&surface_rect, rect->left, rect->top);
+    width = surface_rect.right;
+    height = surface_rect.bottom;
+    if ((data = wayland_win_data_get(window_surface->hwnd)))
+    {
+        if (!IsRectEmpty(&data->rects.visible))
+        {
+            width = data->rects.visible.right - data->rects.visible.left;
+            height = data->rects.visible.bottom - data->rects.visible.top;
+        }
+        wayland_win_data_release(data);
+    }
 
     surface_damage_region = NtGdiCreateRectRgn(rect->left + dirty->left, rect->top + dirty->top,
                                                rect->left + dirty->right, rect->top + dirty->bottom);
@@ -388,14 +410,18 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
         goto done;
     }
 
-    buffer_format = (shape_bits || wws->layered) ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
-    if (wws->wayland_buffer_queue->format != buffer_format)
+    buffer_format = (shape_bits || wws->layered || rect->left || rect->top ||
+                     width > surface_rect.right || height > surface_rect.bottom) ?
+                    WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
+    if (wws->wayland_buffer_queue->format != buffer_format ||
+        wws->wayland_buffer_queue->width != width || wws->wayland_buffer_queue->height != height)
     {
-        int width = wws->wayland_buffer_queue->width;
-        int height = wws->wayland_buffer_queue->height;
-        TRACE("recreating buffer queue with format %d\n", buffer_format);
+        struct wayland_buffer_queue *queue;
+        TRACE("recreating buffer queue %dx%d format %d, GDI rect %s\n",
+              width, height, buffer_format, wine_dbgstr_rect(&surface_rect));
+        if (!(queue = wayland_buffer_queue_create(width, height, buffer_format))) goto done;
         wayland_buffer_queue_destroy(wws->wayland_buffer_queue);
-        wws->wayland_buffer_queue = wayland_buffer_queue_create(width, height, buffer_format);
+        wws->wayland_buffer_queue = queue;
     }
 
     wayland_buffer_queue_add_damage(wws->wayland_buffer_queue, surface_damage_region);
@@ -440,8 +466,8 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     }
 
     wayland_shm_buffer_copy_data(shm_buffer, color_bits, &surface_rect, copy_from_window_region,
-                                 shape_bits && !wws->layered);
-    if (shape_bits) wayland_shm_buffer_copy_shape(shm_buffer, rect, shape_info, shape_bits);
+                                 buffer_format == WL_SHM_FORMAT_ARGB8888 && !wws->layered);
+    if (shape_bits) wayland_shm_buffer_copy_shape(shm_buffer, rect, &surface_rect, shape_info, shape_bits);
 
     NtGdiSetRectRgn(shm_buffer->damage_region, 0, 0, 0, 0);
 

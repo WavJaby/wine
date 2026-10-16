@@ -177,6 +177,7 @@ extern HBRUSH get_sys_color_brush( unsigned int index );
 extern HPEN get_sys_color_pen( unsigned int index );
 extern UINT get_system_dpi(void);
 extern int get_system_metrics( int index );
+extern int get_system_metrics_for_dpi( int index, unsigned int dpi );
 extern struct ratio get_thread_dpi(void);
 extern UINT set_thread_dpi_awareness_context( UINT context );
 extern UINT get_thread_dpi_awareness_context(void);

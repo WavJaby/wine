@@ -382,18 +382,32 @@ static int link_window( struct window *win, struct window *previous )
     return old_prev != win->entry.prev;
 }
 
+static void set_window_dpi( struct window *win, struct ratio dpi, struct ratio raw_dpi )
+{
+    struct window *child;
+
+    if (win->shared->dpi.num == dpi.num && win->shared->dpi.den == dpi.den &&
+        win->shared->raw_dpi.num == raw_dpi.num && win->shared->raw_dpi.den == raw_dpi.den) return;
+
+    SHARED_WRITE_BEGIN( win->shared, window_shm_t )
+    {
+        shared->dpi     = dpi;
+        shared->raw_dpi = raw_dpi;
+    }
+    SHARED_WRITE_END;
+
+    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+        set_window_dpi( child, dpi, raw_dpi );
+    LIST_FOR_EACH_ENTRY( child, &win->unlinked, struct window, entry )
+        set_window_dpi( child, dpi, raw_dpi );
+}
+
 static void set_window_monitor_dpi( struct window *win )
 {
     struct monitor_info *info;
 
     if (!(info = get_monitor_from_rect( win->desktop->winstation, &win->window_rect, 0 ))) return;
-
-    SHARED_WRITE_BEGIN( win->shared, window_shm_t )
-    {
-        shared->dpi     = info->dpi;
-        shared->raw_dpi = info->raw_dpi;
-    }
-    SHARED_WRITE_END;
+    set_window_dpi( win, info->dpi, info->raw_dpi );
 }
 
 /* attach or detach the parent window thread input if necessary */
@@ -432,12 +446,7 @@ static int set_parent_window( struct window *win, struct window *parent )
         link_window( win, WINPTR_TOP );
 
         if (is_desktop_window( parent )) set_window_monitor_dpi( win );
-        else SHARED_WRITE_BEGIN( win->shared, window_shm_t )
-        {
-            shared->dpi         = parent->shared->dpi;
-            shared->raw_dpi     = parent->shared->raw_dpi;
-        }
-        SHARED_WRITE_END;
+        else set_window_dpi( win, parent->shared->dpi, parent->shared->raw_dpi );
 
         if (win->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_PIXEL_FORMAT_CHILD))
             update_pixel_format_flags( win );

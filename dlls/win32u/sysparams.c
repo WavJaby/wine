@@ -2233,6 +2233,14 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
     {
         if (!read_source_mode( source->key, ENUM_CURRENT_SETTINGS, &virtual ) || is_detached_mode( &virtual ))
             virtual = physical;
+        else if (read_source_mode( source->key, WINE_ENUM_PHYSICAL_SETTINGS, &dummy ) &&
+                 virtual.dmPelsWidth == dummy.dmPelsWidth && virtual.dmPelsHeight == dummy.dmPelsHeight &&
+                 virtual.dmPosition.x == dummy.dmPosition.x && virtual.dmPosition.y == dummy.dmPosition.y)
+        {
+            /* An unemulated display follows host layout changes. Keeping its
+             * old position can overlap monitors after fractional-scale metadata arrives. */
+            virtual.dmPosition = physical.dmPosition;
+        }
 
         if ((virtual_modes = get_virtual_modes( current, &physical, host_modes, host_modes_count, &virtual_count )))
         {
@@ -4785,15 +4793,13 @@ static BOOL get_monitor_info( HMONITOR handle, MONITORINFO *info, struct ratio d
 
 static HMONITOR monitor_from_rect( const RECT *rect, UINT flags, struct ratio dpi_from )
 {
-    struct ratio dpi = {system_dpi, 1};
     struct monitor *monitor;
     HMONITOR ret = 0;
-    RECT r;
-
-    r = map_dpi_rect( *rect, dpi_from, dpi );
 
     if (!lock_display_devices( FALSE )) return 0;
-    if ((monitor = get_monitor_from_rect( r, flags, dpi, MDT_DEFAULT ))) ret = monitor->handle;
+    /* Keep per-monitor coordinates in their original space. Converting to
+     * system DPI cannot uniformly map a desktop with different monitor DPIs. */
+    if ((monitor = get_monitor_from_rect( *rect, flags, dpi_from, MDT_DEFAULT ))) ret = monitor->handle;
     unlock_display_devices();
 
     TRACE( "%s flags %x returning %p\n", wine_dbgstr_rect(rect), flags, ret );
@@ -7272,7 +7278,7 @@ int get_system_metrics( int index )
     }
 }
 
-static int get_system_metrics_for_dpi( int index, unsigned int dpi )
+int get_system_metrics_for_dpi( int index, unsigned int dpi )
 {
     NONCLIENTMETRICSW ncm;
     ICONMETRICSW im;

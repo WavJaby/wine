@@ -278,6 +278,13 @@ static const struct wl_registry_listener registry_listener = {
 BOOL wayland_process_init(void)
 {
     struct wl_display *wl_display_wrapper;
+    const char *client_window_state = getenv("WINEWAYLAND_CLIENT_WINDOW_STATE");
+    const char *auto_monitor_dpi = getenv("WINEWAYLAND_AUTO_MONITOR_DPI");
+
+    /* Experimental compatibility mode for decoration-only maximize states.
+     * Geometry constraints still apply, but Win32 owns its maximize style. */
+    process_wayland.client_window_state = client_window_state && !strcmp(client_window_state, "1");
+    process_wayland.auto_monitor_dpi = auto_monitor_dpi && !strcmp(auto_monitor_dpi, "1");
 
     process_wayland.wl_display = wl_display_connect(NULL);
     if (!process_wayland.wl_display)

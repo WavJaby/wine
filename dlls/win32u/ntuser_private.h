@@ -48,6 +48,7 @@ typedef struct tagWND
     struct tagCLASS   *class;         /* Window class */
     struct dce        *dce;           /* DCE pointer */
     struct window_rects rects;        /* window rects in window DPI, relative to the parent client area */
+    struct ratio       notified_monitor_dpi; /* Last monitor DPI delivered to the window */
     RECT               normal_rect;   /* Normal window rect saved when maximized/minimized */
     RECT               present_rect;  /* present rect for exclusive fullscreen mode */
     POINT              min_pos;       /* Position for minimized window */

@@ -25,6 +25,7 @@
 #include "config.h"
 
 #include <assert.h>
+#include <math.h>
 #include <stdlib.h>
 
 #include "ntstatus.h"
@@ -132,6 +133,106 @@ void wayland_win_data_release(struct wayland_win_data *data)
     pthread_mutex_unlock(&win_data_mutex);
 }
 
+/* Caller holds win_data_mutex; callbacks are deferred to the owning GUI thread. */
+void wayland_win_data_post_monitor_change(struct wayland_win_data *data)
+{
+    if (!process_wayland.auto_monitor_dpi || data->monitor_change_pending ||
+        !data->wayland_surface || !wayland_surface_is_toplevel(data->wayland_surface)) return;
+    data->monitor_change_pending = NtUserPostMessage(data->hwnd, WM_WAYLAND_MONITOR_CHANGED, 0, 0);
+}
+
+void wayland_windows_update_monitors(void)
+{
+    struct wayland_win_data *data;
+
+    pthread_mutex_lock(&win_data_mutex);
+    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
+        wayland_win_data_post_monitor_change(data);
+    pthread_mutex_unlock(&win_data_mutex);
+}
+
+/* A removed proxy can make a queued wl_surface.leave argument NULL. */
+void wayland_windows_remove_output(uint32_t global_id)
+{
+    struct wayland_win_data *data;
+    struct wayland_surface *surface;
+    uint32_t *id;
+
+    pthread_mutex_lock(&win_data_mutex);
+    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
+    {
+        if (!(surface = data->wayland_surface)) continue;
+        wl_array_for_each(id, &surface->entered_outputs)
+        {
+            if (*id != global_id) continue;
+            memmove(id, id + 1, (char *)surface->entered_outputs.data + surface->entered_outputs.size - (char *)(id + 1));
+            surface->entered_outputs.size -= sizeof(*id);
+            wayland_win_data_post_monitor_change(data);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&win_data_mutex);
+}
+
+static void wayland_window_update_monitor(HWND hwnd)
+{
+    static const WCHAR window_metrics[] = {'W','i','n','d','o','w','M','e','t','r','i','c','s',0};
+    struct wayland_win_data *data;
+    struct wayland_surface *surface;
+    MONITORINFO current = {.cbSize = sizeof(current)};
+    RECT target, rect;
+    UINT context, dpi_x, dpi_y;
+    uint32_t output_id = 0, scale = 0;
+    BOOL dpi_changed = FALSE;
+
+    if (!(data = wayland_win_data_get(hwnd))) return;
+    data->monitor_change_pending = FALSE;
+    if ((surface = data->wayland_surface) && wayland_surface_is_toplevel(surface) &&
+        surface->entered_outputs.size == sizeof(uint32_t))
+    {
+        output_id = *(uint32_t *)surface->entered_outputs.data;
+        if (surface->has_preferred_scale) scale = lround(surface->window.scale * 120.0);
+    }
+    wayland_win_data_release(data);
+    if (!output_id) return; /* Do not guess the monitor of a spanning window. */
+
+    if (scale) wayland_output_set_surface_scale(output_id, scale);
+    NtUserCallNoParam(NtUserCallNoParam_DisplayModeChanged);
+    if (!wayland_output_get_monitor_rect(output_id, &target)) return;
+
+    context = NtUserSetThreadDpiAwarenessContext(NTUSER_DPI_PER_MONITOR_AWARE);
+    if (NtUserGetWindowRect(hwnd, &rect, 0) &&
+        NtUserGetMonitorInfo(NtUserMonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST), &current))
+    {
+        if (!EqualRect(&current.rcMonitor, &target))
+        {
+            int x = max(0, rect.left - current.rcMonitor.left);
+            int y = max(0, rect.top - current.rcMonitor.top);
+            int width = rect.right - rect.left, height = rect.bottom - rect.top;
+            x = min(x, max(0, target.right - target.left - width));
+            y = min(y, max(0, target.bottom - target.top - height));
+            OffsetRect(&rect, target.left + x - rect.left, target.top + y - rect.top);
+        }
+        TRACE("hwnd=%p output=%u scale=%u target=%s rect=%s\n", hwnd, output_id, scale,
+              wine_dbgstr_rect(&target), wine_dbgstr_rect(&rect));
+        NtUserSetWindowPos(hwnd, 0, rect.left, rect.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    if (NtUserGetDpiForMonitor(NtUserMonitorFromRect(&target, MONITOR_DEFAULTTONEAREST),
+                              MDT_EFFECTIVE_DPI, &dpi_x, &dpi_y) && dpi_x == dpi_y)
+        dpi_changed = wayland_output_update_monitor_dpi(output_id, dpi_x);
+    NtUserSetThreadDpiAwarenessContext(context);
+
+    if (dpi_changed)
+    {
+        struct send_message_timeout_params params = {.flags = SMTO_ABORTIFHUNG, .timeout = 2000};
+
+        /* Surface scale can arrive before output metadata. Notify only after
+         * Win32 monitor APIs expose the changed DPI, including hidden observers. */
+        NtUserMessageCall(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)window_metrics,
+                          &params, NtUserSendMessageTimeout, FALSE);
+    }
+}
+
 static void wayland_win_data_get_config(struct wayland_win_data *data,
                                         struct wayland_window_config *conf)
 {
@@ -219,7 +320,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
         wayland_surface_clear_role(surface);
         break;
     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
-        wayland_surface_make_toplevel(surface);
+        wayland_surface_make_toplevel(surface, &data->rects.visible);
         break;
     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
         wayland_surface_make_subsurface(surface, owner_surface);
@@ -241,6 +342,8 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
 {
     BOOL processing_config = surface->processing.serial &&
                              !surface->processing.processed;
+    enum wayland_surface_config_state previous_state = process_wayland.client_window_state ?
+        surface->sent_window_state : surface->current.state;
 
     TRACE("hwnd=%p window_state=%#x %s->state=%#x\n",
           surface->hwnd, surface->window.state,
@@ -251,13 +354,18 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
      * window state to determine and update the Wayland state. */
     if (!processing_config)
     {
-        xdg_toplevel_set_min_size(surface->xdg_toplevel, 0, 0);
-        xdg_toplevel_set_max_size(surface->xdg_toplevel, 0, 0);
+        if (surface->window.state) surface->client_size_pending = FALSE;
+        if (!surface->client_size_pending)
+        {
+            xdg_toplevel_set_min_size(surface->xdg_toplevel, 0, 0);
+            xdg_toplevel_set_max_size(surface->xdg_toplevel, 0, 0);
+        }
+        wayland_surface_request_client_size(surface);
 
          /* First do all state unsettings, before setting new state. Some
           * Wayland compositors misbehave if the order is reversed. */
         if (!(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
-            (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
+            (previous_state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
             !surface->window.minimized)
         {
             xdg_toplevel_unset_maximized(surface->xdg_toplevel);
@@ -270,7 +378,7 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
         }
 
         if ((surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
-           !(surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
+           !(previous_state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
         {
             xdg_toplevel_set_maximized(surface->xdg_toplevel);
         }
@@ -283,6 +391,7 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
         {
             xdg_toplevel_set_minimized(surface->xdg_toplevel);
         }
+        surface->sent_window_state = surface->window.state;
     }
     else
     {
@@ -509,6 +618,28 @@ static void wayland_configure_window(HWND hwnd)
     surface->processing = surface->requested;
     memset(&surface->requested, 0, sizeof(surface->requested));
 
+    if (surface->client_size_pending)
+    {
+        if (!EqualRect(&surface->processing.rect, &surface->client_size_request) &&
+            surface->client_size_retries++ < 3)
+        {
+            /* A configure for an older size must not overwrite a newer
+             * application resize while temporary constraints negotiate it. */
+            TRACE("hwnd=%p waiting for client size %s, acknowledging stale %s\n", hwnd,
+                  wine_dbgstr_rect(&surface->client_size_request), wine_dbgstr_rect(&surface->processing.rect));
+            surface->current = surface->processing;
+            memset(&surface->processing, 0, sizeof(surface->processing));
+            xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
+            /* A restore may have applied constraints while still maximized.
+             * Commit them again now that the normal configure was received. */
+            wl_surface_commit(surface->wl_surface);
+            wl_display_flush(process_wayland.wl_display);
+            wayland_win_data_release(data);
+            return;
+        }
+        surface->client_size_pending = FALSE;
+    }
+
     state = surface->processing.state;
     /* Ignore size hints if we don't have a state that requires strict
      * size adherence, in order to avoid spurious resizes. */
@@ -543,6 +674,14 @@ static void wayland_configure_window(HWND hwnd)
     }
 
     surface_rect = map_rect_to_surface(surface, surface->window.rect);
+
+    /* Preserve exact Win32 dimensions when the existing window already maps
+     * to the configured logical size. A fractional round trip can otherwise
+     * add a pixel to an application-requested size. */
+    if (process_wayland.client_window_state &&
+        width == surface_rect.right - surface_rect.left &&
+        height == surface_rect.bottom - surface_rect.top)
+        flags |= SWP_NOSIZE;
 
     /* If the window is already fullscreen and its size is compatible with what
      * the compositor is requesting, don't force a resize, since some applications
@@ -592,9 +731,15 @@ static void wayland_configure_window(HWND hwnd)
     if (rect.left == rect.right || rect.bottom == rect.top) flags |= SWP_NOSIZE;
 
     style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
-    if (!(state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) != !(style & WS_MAXIMIZE)
+    if (!process_wayland.client_window_state &&
+        !(state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) != !(style & WS_MAXIMIZE)
         && !(state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
-        NtUserSetWindowLong(hwnd, GWL_STYLE, style ^ WS_MAXIMIZE, FALSE);
+    {
+        /* Use the Win32 state transition rather than a style notification,
+         * which can re-enter frame calculation before the window is resized. */
+        send_message(hwnd, WM_SYSCOMMAND,
+                     state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED ? SC_MAXIMIZE : SC_RESTORE, 0);
+    }
 
     /* The Wayland maximized and fullscreen states are very strict about
      * surface size, so don't let the application override it. The tiled state
@@ -619,6 +764,9 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
     case WM_WAYLAND_INIT_DISPLAY_DEVICES:
         NtUserCallNoParam(NtUserCallNoParam_DisplayModeChanged);
+        return 0;
+    case WM_WAYLAND_MONITOR_CHANGED:
+        wayland_window_update_monitor(hwnd);
         return 0;
     case WM_WAYLAND_CONFIGURE:
         wayland_configure_window(hwnd);

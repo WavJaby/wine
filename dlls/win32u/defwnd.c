@@ -1867,12 +1867,20 @@ static void handle_nc_calc_size( HWND hwnd, WPARAM wparam, RECT *win_rect )
     RECT rect = { 0, 0, 0, 0 };
     DWORD style = get_window_long( hwnd, GWL_STYLE );
     DWORD ex_style = get_window_long( hwnd, GWL_EXSTYLE );
+    UINT context = get_window_dpi_awareness_context( hwnd ), dpi = get_system_dpi();
+
+    /* PMv2 enables non-client DPI scaling without EnableNonClientDpiScaling. */
+    if (NTUSER_DPI_CONTEXT_IS_MONITOR_AWARE( context ) && NTUSER_DPI_CONTEXT_GET_VERSION( context ) == 2)
+    {
+        struct ratio window_dpi = get_dpi_for_window( hwnd );
+        if (window_dpi.den) dpi = (window_dpi.num + window_dpi.den / 2) / window_dpi.den;
+    }
 
     if (!win_rect) return;
 
     if (!(style & WS_MINIMIZE))
     {
-        adjust_window_rect( &rect, style, FALSE, ex_style & ~WS_EX_CLIENTEDGE, get_system_dpi() );
+        adjust_window_rect( &rect, style, FALSE, ex_style & ~WS_EX_CLIENTEDGE, dpi );
 
         win_rect->left   -= rect.left;
         win_rect->top    -= rect.top;
@@ -1889,27 +1897,27 @@ static void handle_nc_calc_size( HWND hwnd, WPARAM wparam, RECT *win_rect )
         }
 
         if (ex_style & WS_EX_CLIENTEDGE)
-            if (win_rect->right - win_rect->left > 2 * get_system_metrics( SM_CXEDGE ) &&
-                   win_rect->bottom - win_rect->top > 2 * get_system_metrics( SM_CYEDGE ))
-                InflateRect( win_rect, -get_system_metrics( SM_CXEDGE ),
-                             -get_system_metrics( SM_CYEDGE ));
+            if (win_rect->right - win_rect->left > 2 * get_system_metrics_for_dpi( SM_CXEDGE, dpi ) &&
+                   win_rect->bottom - win_rect->top > 2 * get_system_metrics_for_dpi( SM_CYEDGE, dpi ))
+                InflateRect( win_rect, -get_system_metrics_for_dpi( SM_CXEDGE, dpi ),
+                             -get_system_metrics_for_dpi( SM_CYEDGE, dpi ));
 
         if ((style & WS_VSCROLL) &&
-            win_rect->right - win_rect->left >= get_system_metrics( SM_CXVSCROLL ))
+            win_rect->right - win_rect->left >= get_system_metrics_for_dpi( SM_CXVSCROLL, dpi ))
         {
             /* rectangle is in screen coords when wparam is false */
             if (!wparam && (ex_style & WS_EX_LAYOUTRTL)) ex_style ^= WS_EX_LEFTSCROLLBAR;
 
             if (ex_style & WS_EX_LEFTSCROLLBAR)
-                win_rect->left  += get_system_metrics( SM_CXVSCROLL );
+                win_rect->left  += get_system_metrics_for_dpi( SM_CXVSCROLL, dpi );
             else
-                win_rect->right -= get_system_metrics( SM_CXVSCROLL );
+                win_rect->right -= get_system_metrics_for_dpi( SM_CXVSCROLL, dpi );
         }
 
         if ((style & WS_HSCROLL) &&
-            win_rect->bottom - win_rect->top > get_system_metrics( SM_CYHSCROLL ))
+            win_rect->bottom - win_rect->top > get_system_metrics_for_dpi( SM_CYHSCROLL, dpi ))
         {
-            win_rect->bottom -= get_system_metrics( SM_CYHSCROLL );
+            win_rect->bottom -= get_system_metrics_for_dpi( SM_CYHSCROLL, dpi );
         }
 
         if (win_rect->top > win_rect->bottom) win_rect->bottom = win_rect->top;

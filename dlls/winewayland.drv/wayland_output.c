@@ -33,7 +33,6 @@
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
 static const int32_t default_refresh = 60000;
-static uint32_t next_output_id = 0;
 
 #define WAYLAND_OUTPUT_CHANGED_MODES      0x01
 #define WAYLAND_OUTPUT_CHANGED_NAME       0x02
@@ -103,6 +102,47 @@ static void wayland_output_state_add_mode(struct wayland_output_state *state,
     if (current) state->current_mode = mode;
 }
 
+/* Desktop properties keep observed output scales consistent across Wine processes.
+ * An unmapped output without xdg-output metadata retains the system DPI. */
+static void surface_scale_property(uint32_t global_id, WCHAR *name)
+{
+    char ascii[64];
+    unsigned int i;
+
+    snprintf(ascii, sizeof(ascii), "__wine_wayland_scale_%u", global_id);
+    for (i = 0; (name[i] = ascii[i]); ++i) continue;
+}
+
+uint32_t wayland_output_get_surface_scale(uint32_t global_id)
+{
+    WCHAR name[64];
+
+    if (!process_wayland.initialized) return 0;
+    surface_scale_property(global_id, name);
+    return HandleToULong(NtUserGetProp(NtUserGetDesktopWindow(), name));
+}
+
+BOOL wayland_output_set_surface_scale(uint32_t global_id, uint32_t scale)
+{
+    WCHAR name[64];
+
+    if (scale < 60 || scale > 960 || scale == wayland_output_get_surface_scale(global_id)) return FALSE;
+    surface_scale_property(global_id, name);
+    return NtUserSetProp(NtUserGetDesktopWindow(), name, ULongToHandle(scale));
+}
+
+BOOL wayland_output_update_monitor_dpi(uint32_t global_id, UINT dpi)
+{
+    WCHAR name[64];
+    char ascii[64];
+    unsigned int i;
+
+    snprintf(ascii, sizeof(ascii), "__wine_wayland_dpi_%u", global_id);
+    for (i = 0; (name[i] = ascii[i]); ++i) continue;
+    if (!dpi || dpi == HandleToULong(NtUserGetProp(NtUserGetDesktopWindow(), name))) return FALSE;
+    return NtUserSetProp(NtUserGetDesktopWindow(), name, ULongToHandle(dpi));
+}
+
 static void maybe_init_display_devices(void)
 {
     DWORD desktop_pid = 0;
@@ -165,6 +205,7 @@ static void wayland_output_done(struct wayland_output *output)
     {
         output->current.logical_w = output->pending.logical_w;
         output->current.logical_h = output->pending.logical_h;
+        output->current.has_logical_size = TRUE;
     }
 
     output->pending_flags = 0;
@@ -191,6 +232,7 @@ static void wayland_output_done(struct wayland_output *output)
     }
 
     maybe_init_display_devices();
+    if (process_wayland.initialized && process_wayland.auto_monitor_dpi) wayland_windows_update_monitors();
 }
 
 static void output_handle_geometry(void *data, struct wl_output *wl_output,
@@ -200,6 +242,12 @@ static void output_handle_geometry(void *data, struct wl_output *wl_output,
                                    const char *make, const char *model,
                                    int32_t output_transform)
 {
+    struct wayland_output *output = data;
+
+    if (!process_wayland.auto_monitor_dpi || output->zxdg_output_v1) return;
+    output->pending.logical_x = x;
+    output->pending.logical_y = y;
+    output->pending_flags |= WAYLAND_OUTPUT_CHANGED_LOGICAL_XY;
 }
 
 static void output_handle_mode(void *data, struct wl_output *wl_output,
@@ -233,11 +281,26 @@ static void output_handle_scale(void *data, struct wl_output *wl_output,
 {
 }
 
+static void output_handle_name(void *data, struct wl_output *wl_output, const char *name)
+{
+    struct wayland_output *output = data;
+
+    free(output->pending.name);
+    output->pending.name = strdup(name);
+    output->pending_flags |= WAYLAND_OUTPUT_CHANGED_NAME;
+}
+
+static void output_handle_description(void *data, struct wl_output *wl_output, const char *description)
+{
+}
+
 static const struct wl_output_listener output_listener = {
-    output_handle_geometry,
-    output_handle_mode,
-    output_handle_done,
-    output_handle_scale
+    .geometry = output_handle_geometry,
+    .mode = output_handle_mode,
+    .done = output_handle_done,
+    .scale = output_handle_scale,
+    .name = output_handle_name,
+    .description = output_handle_description,
 };
 
 static void zxdg_output_v1_handle_logical_position(void *data,
@@ -317,7 +380,7 @@ BOOL wayland_output_create(uint32_t id, uint32_t version)
 
     output->wl_output = wl_registry_bind(process_wayland.wl_registry, id,
                                          &wl_output_interface,
-                                         version < 2 ? version : 2);
+                                         version < 4 ? version : 4);
     output->global_id = id;
     wl_output_add_listener(output->wl_output, &output_listener, output);
 
@@ -328,11 +391,11 @@ BOOL wayland_output_create(uint32_t id, uint32_t version)
     output->current.modes_count = 0;
 
     /* Have a fallback while we don't have compositor given name. */
-    name_len = snprintf(NULL, 0, "WaylandOutput%d", next_output_id);
+    name_len = snprintf(NULL, 0, "WaylandOutput%u", id);
     output->current.name = malloc(name_len + 1);
     if (output->current.name)
     {
-        snprintf(output->current.name, name_len + 1, "WaylandOutput%d", next_output_id++);
+        snprintf(output->current.name, name_len + 1, "WaylandOutput%u", id);
     }
     else
     {
@@ -367,9 +430,18 @@ static void wayland_output_state_deinit(struct wayland_output_state *state)
  */
 void wayland_output_destroy(struct wayland_output *output)
 {
+    WCHAR name[64];
+
+    if (process_wayland.initialized && process_wayland.auto_monitor_dpi)
+    {
+        surface_scale_property(output->global_id, name);
+        NtUserRemoveProp(NtUserGetDesktopWindow(), name);
+    }
     pthread_mutex_lock(&process_wayland.output_mutex);
     wl_list_remove(&output->link);
     pthread_mutex_unlock(&process_wayland.output_mutex);
+    if (process_wayland.initialized && process_wayland.auto_monitor_dpi)
+        wayland_windows_remove_output(output->global_id);
 
     wayland_output_state_deinit(&output->pending);
     wayland_output_state_deinit(&output->current);

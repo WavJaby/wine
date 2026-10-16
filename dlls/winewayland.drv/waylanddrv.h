@@ -70,6 +70,7 @@ enum wayland_window_message
     WM_WAYLAND_INIT_DISPLAY_DEVICES = WM_WINE_FIRST_DRIVER_MSG,
     WM_WAYLAND_CONFIGURE,
     WM_WAYLAND_SET_FOREGROUND,
+    WM_WAYLAND_MONITOR_CHANGED,
 };
 
 enum wayland_surface_config_state
@@ -120,6 +121,15 @@ struct wayland_pointer
     struct wayland_cursor cursor;
     double accum_x;
     double accum_y;
+    struct
+    {
+        double value;
+        double remainder;
+        int value120;
+        BOOL has_value120;
+        BOOL stopped;
+    } scroll[2];
+    uint32_t scroll_source;
     pthread_mutex_t mutex;
 };
 
@@ -166,6 +176,8 @@ struct wayland_data_device
 struct wayland
 {
     BOOL initialized;
+    BOOL client_window_state;
+    BOOL auto_monitor_dpi;
     struct wl_display *wl_display;
     struct wl_event_queue *wl_event_queue;
     struct wl_registry *wl_registry;
@@ -215,6 +227,8 @@ struct wayland_output_state
     char *name;
     int logical_x, logical_y;
     int logical_w, logical_h;
+    BOOL has_logical_size;
+    uint32_t learned_scale;
 };
 
 struct wayland_output
@@ -278,6 +292,8 @@ struct wayland_surface
     HWND hwnd;
 
     struct wl_surface *wl_surface;
+    struct wl_array entered_outputs; /* Registry IDs, not output object pointers */
+    BOOL has_preferred_scale;
     struct wp_viewport *wp_viewport;
     struct wp_fractional_scale_v1 *wp_fractional_scale_v1;
     struct wayland_shm_buffer *small_icon_buffer;
@@ -301,6 +317,10 @@ struct wayland_surface
     struct wp_alpha_modifier_surface_v1 *wp_alpha_modifier_surface_v1;
 
     struct wayland_surface_config pending, requested, processing, current;
+    enum wayland_surface_config_state sent_window_state;
+    RECT client_size_request;
+    BOOL client_size_pending;
+    unsigned int client_size_retries;
     BOOL resizing;
     struct wayland_window_config window;
     int content_width, content_height;
@@ -320,6 +340,11 @@ BOOL wayland_process_init(void);
 BOOL wayland_output_create(uint32_t id, uint32_t version);
 void wayland_output_destroy(struct wayland_output *output);
 void wayland_output_use_xdg_extension(struct wayland_output *output);
+double wayland_output_get_initial_scale(const RECT *window_rect);
+BOOL wayland_output_get_monitor_rect(uint32_t global_id, RECT *rect);
+BOOL wayland_output_set_surface_scale(uint32_t global_id, uint32_t scale);
+BOOL wayland_output_update_monitor_dpi(uint32_t global_id, UINT dpi);
+uint32_t wayland_output_get_surface_scale(uint32_t global_id);
 
 /**********************************************************************
  *          Wayland surface
@@ -327,7 +352,7 @@ void wayland_output_use_xdg_extension(struct wayland_output *output);
 
 struct wayland_surface *wayland_surface_create(HWND hwnd);
 void wayland_surface_destroy(struct wayland_surface *surface);
-void wayland_surface_make_toplevel(struct wayland_surface *surface);
+void wayland_surface_make_toplevel(struct wayland_surface *surface, const RECT *window_rect);
 void wayland_surface_make_subsurface(struct wayland_surface *surface,
                                      struct wayland_surface *parent);
 void wayland_surface_clear_role(struct wayland_surface *surface);
@@ -335,6 +360,7 @@ void wayland_surface_attach_shm(struct wayland_surface *surface,
                                 struct wayland_shm_buffer *shm_buffer,
                                 HRGN surface_damage_region);
 BOOL wayland_surface_reconfigure(struct wayland_surface *surface);
+void wayland_surface_request_client_size(struct wayland_surface *surface);
 BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf, RECT rect,
                                           enum wayland_surface_config_state state);
 RECT map_rect_to_surface(struct wayland_surface *surface, RECT rect);
@@ -386,10 +412,14 @@ struct wayland_win_data
     BOOL resizeable;
     BOOL managed;
     BOOL layered_attribs_set;
+    BOOL monitor_change_pending;
 };
 
 struct wayland_win_data *wayland_win_data_get(HWND hwnd);
 void wayland_win_data_release(struct wayland_win_data *data);
+void wayland_win_data_post_monitor_change(struct wayland_win_data *data);
+void wayland_windows_update_monitors(void);
+void wayland_windows_remove_output(uint32_t global_id);
 
 struct wayland_client_surface *get_client_surface(HWND hwnd);
 void set_client_surface(HWND hwnd, struct wayland_client_surface *client);

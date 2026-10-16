@@ -25,6 +25,7 @@
 #include "config.h"
 
 #include <assert.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -137,6 +138,53 @@ static const struct xdg_toplevel_listener xdg_toplevel_listener =
     xdg_toplevel_handle_close
 };
 
+static void surface_handle_enter(void *user_data, struct wl_surface *wl_surface, struct wl_output *wl_output)
+{
+    struct wayland_win_data *data;
+    struct wayland_output *output = wl_output ? wl_output_get_user_data(wl_output) : NULL;
+    struct wayland_surface *surface;
+    uint32_t *id;
+
+    if (!process_wayland.auto_monitor_dpi || !output || !(data = wayland_win_data_get(user_data))) return;
+    if ((surface = data->wayland_surface))
+    {
+        wl_array_for_each(id, &surface->entered_outputs)
+            if (*id == output->global_id) goto done;
+        if ((id = wl_array_add(&surface->entered_outputs, sizeof(*id)))) *id = output->global_id;
+        wayland_win_data_post_monitor_change(data);
+    }
+done:
+    wayland_win_data_release(data);
+}
+
+static void surface_handle_leave(void *user_data, struct wl_surface *wl_surface, struct wl_output *wl_output)
+{
+    struct wayland_win_data *data;
+    struct wayland_output *output = wl_output ? wl_output_get_user_data(wl_output) : NULL;
+    struct wayland_surface *surface;
+    uint32_t *id;
+
+    if (!process_wayland.auto_monitor_dpi || !output || !(data = wayland_win_data_get(user_data))) return;
+    if ((surface = data->wayland_surface))
+    {
+        wl_array_for_each(id, &surface->entered_outputs)
+        {
+            if (*id != output->global_id) continue;
+            memmove(id, id + 1, (char *)surface->entered_outputs.data + surface->entered_outputs.size - (char *)(id + 1));
+            surface->entered_outputs.size -= sizeof(*id);
+            break;
+        }
+        wayland_win_data_post_monitor_change(data);
+    }
+    wayland_win_data_release(data);
+}
+
+static const struct wl_surface_listener surface_listener =
+{
+    .enter = surface_handle_enter,
+    .leave = surface_handle_leave,
+};
+
 void wp_fractional_scale_handle_scale(void* user_data,
                                       struct wp_fractional_scale_v1 *fractional_scale_v1,
                                       uint32_t scale_fixed)
@@ -149,13 +197,22 @@ void wp_fractional_scale_handle_scale(void* user_data,
     TRACE("hwnd=%p scale=%lf\n", hwnd, scale);
 
     if (!(data = wayland_win_data_get(hwnd))) return;
-    if (!(surface = data->wayland_surface) || scale == surface->window.scale)
+    if (!(surface = data->wayland_surface))
+    {
+        wayland_win_data_release(data);
+        return;
+    }
+    surface->has_preferred_scale = TRUE;
+    wayland_win_data_post_monitor_change(data);
+    if (scale == surface->window.scale)
     {
         wayland_win_data_release(data);
         return;
     }
 
     surface->window.scale = scale;
+
+    wayland_surface_request_client_size(surface);
 
     /* reattach client surfaces as their rects have changed */
     update_client_surfaces(hwnd);
@@ -196,13 +253,14 @@ struct wayland_surface *wayland_surface_create(HWND hwnd)
     TRACE("surface=%p\n", surface);
 
     surface->hwnd = hwnd;
+    wl_array_init(&surface->entered_outputs);
     surface->wl_surface = wl_compositor_create_surface(process_wayland.wl_compositor);
     if (!surface->wl_surface)
     {
         ERR("Failed to create wl_surface Wayland surface\n");
         goto err;
     }
-    wl_surface_set_user_data(surface->wl_surface, hwnd);
+    wl_surface_add_listener(surface->wl_surface, &surface_listener, hwnd);
 
     surface->wp_viewport =
         wp_viewporter_get_viewport(process_wayland.wp_viewporter,
@@ -262,6 +320,7 @@ void wayland_surface_destroy(struct wayland_surface *surface)
     pthread_mutex_unlock(&process_wayland.text_input.mutex);
 
     wayland_surface_clear_role(surface);
+    wl_array_release(&surface->entered_outputs);
 
     if (surface->wp_alpha_modifier_surface_v1)
     {
@@ -325,7 +384,7 @@ static void wayland_surface_init_fractional_scale(struct wayland_surface *surfac
  *
  * Gives the toplevel role to a plain wayland surface.
  */
-void wayland_surface_make_toplevel(struct wayland_surface *surface)
+void wayland_surface_make_toplevel(struct wayland_surface *surface, const RECT *window_rect)
 {
     WCHAR text[1024];
 
@@ -355,7 +414,9 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface)
 
     wayland_surface_assign_icon(surface);
 
-    wayland_surface_init_fractional_scale(surface, 1.0);
+    wayland_surface_init_fractional_scale(surface,
+        process_wayland.wp_fractional_scale_manager_v1 ?
+        wayland_output_get_initial_scale(window_rect) : 1.0);
 
     wl_surface_commit(surface->wl_surface);
     wl_display_flush(process_wayland.wl_display);
@@ -472,6 +533,8 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
     memset(&surface->requested, 0, sizeof(surface->requested));
     memset(&surface->processing, 0, sizeof(surface->processing));
     memset(&surface->current, 0, sizeof(surface->current));
+    surface->sent_window_state = 0;
+    surface->client_size_pending = FALSE;
 
     /* Ensure no buffer is attached, otherwise future role assignments may fail. */
     wl_surface_attach(surface->wl_surface, NULL, 0, 0);
@@ -564,7 +627,8 @@ BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf, R
         return TRUE;
 
     /* We require the same state. */
-    if ((state & mask) != (conf->state & mask)) return FALSE;
+    if (!process_wayland.client_window_state &&
+        (state & mask) != (conf->state & mask)) return FALSE;
 
     /* The maximized state requires the configured size. During surface
      * reconfiguration we can use surface geometry to provide smaller areas
@@ -608,6 +672,36 @@ static void wayland_surface_get_rect_in_monitor(struct wayland_surface *surface,
  *
  * Sets the xdg_surface geometry
  */
+void wayland_surface_request_client_size(struct wayland_surface *surface)
+{
+    RECT rect;
+    int width, height;
+
+    if (!process_wayland.client_window_state || !wayland_surface_is_toplevel(surface) ||
+        surface->window.state || surface->window.minimized) return;
+
+    rect = map_rect_to_surface(surface, surface->window.rect);
+    OffsetRect(&rect, -rect.left, -rect.top);
+    /* A pending request can be older even when the new size matches the last
+     * committed configure. Replace it so its eventual reply cannot undo a DPI resize. */
+    if (IsRectEmpty(&rect) ||
+        (!surface->client_size_pending && EqualRect(&rect, &surface->current.rect)) ||
+        (surface->client_size_pending && EqualRect(&rect, &surface->client_size_request))) return;
+
+    surface->client_size_request = rect;
+    surface->client_size_pending = TRUE;
+    surface->client_size_retries = 0;
+    width = rect.right;
+    height = rect.bottom;
+    TRACE("hwnd=%p requesting client size %dx%d\n", surface->hwnd, width, height);
+
+    /* Negotiate the application resize before attaching incompatible content.
+     * Constraints are temporary and released after a matching configure. */
+    xdg_toplevel_set_min_size(surface->xdg_toplevel, width, height);
+    xdg_toplevel_set_max_size(surface->xdg_toplevel, width, height);
+    wl_surface_commit(surface->wl_surface);
+}
+
 static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface, RECT rect)
 {
     /* If the window size is bigger than the current state accepts, use the
@@ -651,7 +745,14 @@ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface
         xdg_surface_set_window_geometry(surface->xdg_surface,
                                         rect.left, rect.top,
                                         width, height);
-        if (surface->window.resizeable)
+        if (surface->client_size_pending)
+        {
+            xdg_toplevel_set_min_size(surface->xdg_toplevel, surface->client_size_request.right,
+                                      surface->client_size_request.bottom);
+            xdg_toplevel_set_max_size(surface->xdg_toplevel, surface->client_size_request.right,
+                                      surface->client_size_request.bottom);
+        }
+        else if (surface->window.resizeable)
         {
             xdg_toplevel_set_min_size(surface->xdg_toplevel, 0, 0);
             xdg_toplevel_set_max_size(surface->xdg_toplevel, 0, 0);
@@ -871,13 +972,15 @@ struct wayland_shm_buffer *wayland_shm_buffer_create(int width, int height,
     struct wl_shm_pool *pool;
     int stride, size;
 
-    stride = width * WINEWAYLAND_BYTES_PER_PIXEL;
-    size = stride * height;
-    if (size == 0)
+    /* wl_shm uses signed 32-bit sizes and strides. Validate before multiplying. */
+    if (width <= 0 || height <= 0 || width > INT_MAX / WINEWAYLAND_BYTES_PER_PIXEL ||
+        height > INT_MAX / (width * WINEWAYLAND_BYTES_PER_PIXEL))
     {
         ERR("Invalid shm_buffer size %dx%d\n", width, height);
         goto err;
     }
+    stride = width * WINEWAYLAND_BYTES_PER_PIXEL;
+    size = stride * height;
 
     shm_buffer = calloc(1, sizeof(*shm_buffer));
     if (!shm_buffer)
