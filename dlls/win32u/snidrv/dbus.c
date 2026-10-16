@@ -406,7 +406,7 @@ static DBusHandlerResult name_owner_filter( DBusConnection *ctx, DBusMessage *ms
                 old_path = status_notifier_dst_path;
                 status_notifier_dst_path = strdup(new_path);
                 free(old_path);
-                pthread_mutex_lock(&list_mutex);
+                pthread_mutex_unlock(&list_mutex);
             }
         }
         else if (strcmp(interface_name, notifications_interface_name) == 0)
