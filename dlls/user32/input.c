@@ -825,6 +825,12 @@ BOOL WINAPI GetPointerFramePenInfoHistory( UINT32 id, UINT32 *entries, UINT32 *p
     return NtUserGetPointerInfoList( id, PT_PEN, 0, 0, sizeof(*info), entries, pointers, info );
 }
 
+BOOL WINAPI SkipPointerFrameMessages( UINT32 id )
+{
+    FIXME( "id %u stub, frame messages are not skipped!\n", id );
+    return TRUE;
+}
+
 
 /*******************************************************************
  *           GetActiveWindow  (USER32.@)
