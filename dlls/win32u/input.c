@@ -3164,12 +3164,29 @@ BOOL WINAPI NtUserGetPointerInfoList( UINT32 id, POINTER_INPUT_TYPE type, UINT_P
         return FALSE;
     }
 
-    if (type != PT_POINTER) FIXME( "Pointer type %#x not implemented\n", type );
-
     *entry_count = 1;
     *pointer_count = 1;
 
     memset( pointer_info, 0, size );
+    if (type == PT_TOUCH)
+    {
+        /* Touch-only fields; placeholder contact box and pressure until the digitizer reports real values. */
+        POINTER_TOUCH_INFO *touch = pointer_info;
+        const POINT loc = pointer->info.ptPixelLocation, raw = pointer->info.ptPixelLocationRaw;
+        RECT contact = { loc.x - 2, loc.y - 2, loc.x + 2, loc.y + 2 };
+        RECT contact_raw = { raw.x - 2, raw.y - 2, raw.x + 2, raw.y + 2 };
+
+        touch->pointerInfo = pointer->info;
+        touch->touchMask = TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE;
+        touch->rcContact = contact;
+        touch->rcContactRaw = contact_raw;
+        touch->orientation = 90;
+        touch->pressure = 512;
+        return TRUE;
+    }
+
+    if (type != PT_POINTER) FIXME( "Pointer type %#x not implemented\n", type );
+
     *(POINTER_INFO *)pointer_info = pointer->info;
     return TRUE;
 }
