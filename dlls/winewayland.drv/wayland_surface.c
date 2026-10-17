@@ -677,8 +677,10 @@ void wayland_surface_request_client_size(struct wayland_surface *surface)
     RECT rect;
     int width, height;
 
+    /* Not before the initial configure: min == max on the mapping commit makes compositors (Hyprland) treat
+     * the toplevel as fixed-size and float it for good, and the initial configure picks the size anyway. */
     if (!process_wayland.client_window_state || !wayland_surface_is_toplevel(surface) ||
-        surface->window.state || surface->window.minimized) return;
+        surface->window.state || surface->window.minimized || !surface->current.serial) return;
 
     rect = map_rect_to_surface(surface, surface->window.rect);
     OffsetRect(&rect, -rect.left, -rect.top);

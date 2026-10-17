@@ -278,13 +278,22 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     struct wayland_surface *surface;
     enum wayland_surface_role role;
     BOOL visible;
-    DWORD exstyle = NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE);
+    DWORD style, exstyle = NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE);
     struct wl_region *input_region;
 
     TRACE("hwnd=%p\n", data->hwnd);
 
-    visible = ((NtUserGetWindowLongW(data->hwnd, GWL_STYLE) & WS_VISIBLE) == WS_VISIBLE) &&
+    style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
+    visible = ((style & WS_VISIBLE) == WS_VISIBLE) &&
                (!(exstyle & WS_EX_LAYERED) || data->layered_attribs_set);
+
+    /* A hidden toplevel shown minimized (SW_SHOWMINNOACTIVE: LINE does this on every incoming message) only
+     * gets a taskbar button on Windows. Mapping it would show it, and the compositor's first configure would
+     * then read as a user restore (see wayland_configure_window) and pop the window up. Keep it unmapped until
+     * it is restored. A toplevel minimized while mapped keeps its role. */
+    if (visible && (style & WS_MINIMIZE) && !owner_surface &&
+        !(data->wayland_surface && data->wayland_surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL))
+        visible = FALSE;
 
     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
     else if (owner_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
