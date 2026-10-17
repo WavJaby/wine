@@ -331,6 +331,7 @@ struct wayland_surface
             struct xdg_surface *xdg_surface;
             struct xdg_toplevel *xdg_toplevel;
             struct xdg_toplevel_icon_v1 *xdg_toplevel_icon;
+            HWND toplevel_parent; /* window last passed to xdg_toplevel_set_parent */
         };
         struct
         {

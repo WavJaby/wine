@@ -395,6 +395,7 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface, const RECT *
 
     wayland_surface_clear_role(surface);
     surface->role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
+    surface->toplevel_parent = 0;
 
     surface->xdg_surface =
         xdg_wm_base_get_xdg_surface(process_wayland.xdg_wm_base, surface->wl_surface);
@@ -678,9 +679,13 @@ void wayland_surface_request_client_size(struct wayland_surface *surface)
     int width, height;
 
     /* Not before the initial configure: min == max on the mapping commit makes compositors (Hyprland) treat
-     * the toplevel as fixed-size and float it for good, and the initial configure picks the size anyway. */
+     * the toplevel as fixed-size and float it for good, and the initial configure picks the size anyway.
+     * Not while the compositor holds the window tiled/maximized/fullscreen either: those states dictate the
+     * size, and a negotiated client size would leave Win32 drawing past the tile (cropped right half). */
     if (!process_wayland.client_window_state || !wayland_surface_is_toplevel(surface) ||
-        surface->window.state || surface->window.minimized || !surface->current.serial) return;
+        surface->window.state || surface->window.minimized || !surface->current.serial ||
+        (surface->current.state & (WAYLAND_SURFACE_CONFIG_STATE_TILED | WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
+                                   WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))) return;
 
     rect = map_rect_to_surface(surface, surface->window.rect);
     OffsetRect(&rect, -rect.left, -rect.top);

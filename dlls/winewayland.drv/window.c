@@ -546,15 +546,40 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const str
     return TRUE;
 }
 
+/* An unowned WS_EX_TOOLWINDOW toplevel is a floating panel on Windows (LINE's sticker picker), but carries no
+ * owner, so nothing tells the compositor it is not an application window and tiling compositors tile it.
+ * Parent it to the process's frontmost unowned non-tool toplevel: xdg parents are what compositors use to
+ * float and stack auxiliary windows. Owned windows are subsurfaces and unaffected. */
+static HWND find_toolwindow_parent(HWND hwnd)
+{
+    DWORD pid, self = GetCurrentProcessId();
+    HWND w;
+
+    if (!(NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) return 0;
+    if (NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_CHILD) return 0;
+    if (NtUserGetWindowRelative(hwnd, GW_OWNER)) return 0;
+
+    for (w = NtUserGetWindowRelative(hwnd, GW_HWNDFIRST); w; w = NtUserGetWindowRelative(w, GW_HWNDNEXT))
+    {
+        DWORD style = NtUserGetWindowLongW(w, GWL_STYLE);
+        if (w == hwnd || !(style & WS_VISIBLE) || (style & WS_MINIMIZE)) continue;
+        if (NtUserGetWindowLongW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) continue;
+        if (NtUserGetWindowRelative(w, GW_OWNER)) continue;
+        if (!NtUserGetWindowThread(w, &pid) || pid != self) continue;
+        return w;
+    }
+    return 0;
+}
+
 /***********************************************************************
  *           WAYLAND_WindowPosChanged
  */
 void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                               const struct window_rects *new_rects, struct window_surface *surface)
 {
-    HWND owner = NtUserGetAncestor(hwnd, GA_ROOT);
+    HWND owner = NtUserGetAncestor(hwnd, GA_ROOT), tool_parent;
     struct wayland_surface *owner_surface;
-    struct wayland_win_data *data, *owner_data;
+    struct wayland_win_data *data, *owner_data, *parent_data;
     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
 
     TRACE("hwnd %p new_rects %s after %p flags %08x\n", hwnd, debugstr_window_rects(new_rects), insert_after, swp_flags);
@@ -563,6 +588,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
      * may need to query win_data information about other HWNDs and thus
      * acquire the lock itself internally. */
     if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) owner = owner_hint;
+    tool_parent = surface ? find_toolwindow_parent(hwnd) : 0;
 
     if (!(data = wayland_win_data_get(hwnd))) return;
     owner_data = owner && owner != hwnd ? wayland_win_data_get(owner) : NULL;
@@ -583,6 +609,21 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     }
     else if (wayland_win_data_create_wayland_surface(data, owner_surface))
     {
+        struct wayland_surface *wayland_surface = data->wayland_surface;
+
+        if (wayland_surface_is_toplevel(wayland_surface) && wayland_surface->toplevel_parent != tool_parent)
+        {
+            parent_data = tool_parent ? wayland_win_data_get(tool_parent) : NULL;
+            if (!tool_parent || (parent_data && parent_data->wayland_surface &&
+                                 wayland_surface_is_toplevel(parent_data->wayland_surface)))
+            {
+                TRACE("hwnd=%p toolwindow parent %p\n", hwnd, tool_parent);
+                xdg_toplevel_set_parent(wayland_surface->xdg_toplevel,
+                                        parent_data ? parent_data->wayland_surface->xdg_toplevel : NULL);
+                wayland_surface->toplevel_parent = tool_parent;
+            }
+            if (parent_data) wayland_win_data_release(parent_data);
+        }
         wayland_win_data_update_wayland_state(data);
     }
 
@@ -629,6 +670,10 @@ static void wayland_configure_window(HWND hwnd)
 
     if (surface->client_size_pending)
     {
+        /* A tiled/maximized/fullscreen configure is a size the compositor insists on, not a stale reply. */
+        if (surface->processing.state & (WAYLAND_SURFACE_CONFIG_STATE_TILED | WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
+                                         WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
+            surface->client_size_retries = 3;
         if (!EqualRect(&surface->processing.rect, &surface->client_size_request) &&
             surface->client_size_retries++ < 3)
         {
