@@ -1,0 +1,14 @@
+MODULE    = wpnapps.dll
+UNIXLIB   = wpnapps.so
+IMPORTLIB = wpnapps
+IMPORTS   = combase uuid
+UNIX_CFLAGS = $(DBUS_CFLAGS)
+UNIX_LIBS   = $(DBUS_LIBS)
+
+SOURCES = \
+	classes.idl \
+	main.c \
+	notify.c \
+	toast.c \
+	unixlib.c \
+	xml.c
