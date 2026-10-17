@@ -2635,12 +2635,9 @@ static BOOL should_use_portal_for_itemdlg(FileDialogImpl *This)
             return FALSE;
         }
 
-        /* Don't use if events listeners are registered */
-        if (!list_empty(&This->events_clients))
-        {
-            TRACE("Event listeners present, not using portal\n");
-            return FALSE;
-        }
+        /* Event listeners do not disqualify: Qt and most toolkits Advise() only for informational callbacks, the portal
+         * path fires OnFileOk with the result, and the portal backend does its own overwrite prompt. Excluding them
+         * kept every Qt application (LINE) on Wine's dialog. */
     }
 
     /* Check if Unix library is available */
