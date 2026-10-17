@@ -350,17 +350,25 @@ static void wayland_add_device_monitor(const struct gdi_device_manager *device_m
                                        struct output_info *primary)
 {
     struct gdi_monitor monitor = {0};
+    int work_w, work_h;
 
     SetRect(&monitor.rc_monitor, output_info->x, output_info->y,
             output_info->x + output_info->output->current_mode->width,
             output_info->y + output_info->output->current_mode->height);
     OffsetRect(&monitor.rc_monitor, -primary->x, -primary->y);
 
-    /* We don't have a direct way to get the work area in Wayland. */
+    /* Wayland has no work-area protocol; use the maximized size learned for this output, if any. */
     monitor.rc_work = monitor.rc_monitor;
+    if (wayland_output_get_work_size(output_info->global_id, &work_w, &work_h) &&
+        work_w <= monitor.rc_monitor.right - monitor.rc_monitor.left &&
+        work_h <= monitor.rc_monitor.bottom - monitor.rc_monitor.top)
+    {
+        monitor.rc_work.right = monitor.rc_work.left + work_w;
+        monitor.rc_work.bottom = monitor.rc_work.top + work_h;
+    }
 
-    TRACE("name=%s rc_monitor=rc_work=%s\n",
-          output_info->output->name, wine_dbgstr_rect(&monitor.rc_monitor));
+    TRACE("name=%s rc_monitor=%s rc_work=%s\n", output_info->output->name,
+          wine_dbgstr_rect(&monitor.rc_monitor), wine_dbgstr_rect(&monitor.rc_work));
 
     device_manager->add_monitor(&monitor, param);
 }

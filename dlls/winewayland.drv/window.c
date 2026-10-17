@@ -643,6 +643,7 @@ static void wayland_configure_window(HWND hwnd)
     BOOL restoring_from_minimize = FALSE;
     struct wayland_win_data *data;
     RECT rect, surface_rect;
+    uint32_t work_output = 0;
 
     if (!(data = wayland_win_data_get(hwnd))) return;
     if (!(surface = data->wayland_surface))
@@ -772,7 +773,22 @@ static void wayland_configure_window(HWND hwnd)
     rect = map_rect_from_surface(surface, rect);
     OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
 
+    /* A configure answering an application maximize carries the output's usable area. Hyprland also sends the
+     * maximized state to every tiled window, hence the Win32 state check. */
+    if ((surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
+        (state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) && !(state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
+        width && height && surface->entered_outputs.size == sizeof(uint32_t))
+        work_output = *(uint32_t *)surface->entered_outputs.data;
+
     wayland_win_data_release(data);
+
+    /* Before the resize below, so the application's WM_NCCALCSIZE already sees the new work area. */
+    if (work_output && wayland_output_set_work_size(work_output, rect.right - rect.left, rect.bottom - rect.top))
+    {
+        TRACE("hwnd=%p output=%u work area %dx%d\n", hwnd, work_output,
+              (int)(rect.right - rect.left), (int)(rect.bottom - rect.top));
+        NtUserCallNoParam(NtUserCallNoParam_DisplayModeChanged);
+    }
 
     TRACE("processing=%dx%d,%#x\n", width, height, state);
 

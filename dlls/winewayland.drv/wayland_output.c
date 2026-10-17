@@ -131,6 +131,43 @@ BOOL wayland_output_set_surface_scale(uint32_t global_id, uint32_t scale)
     return NtUserSetProp(NtUserGetDesktopWindow(), name, ULongToHandle(scale));
 }
 
+/* Work area learned from a maximized configure: Wayland has no work-area protocol, but the size a compositor
+ * gives a maximized toplevel is the output minus its panels and gaps. Kept as a desktop property like the
+ * scale, packed as MAKELONG(width, height) in output pixels. */
+static void work_size_property(uint32_t global_id, WCHAR *name)
+{
+    char ascii[64];
+    unsigned int i;
+
+    snprintf(ascii, sizeof(ascii), "__wine_wayland_work_%u", global_id);
+    for (i = 0; (name[i] = ascii[i]); ++i) continue;
+}
+
+BOOL wayland_output_set_work_size(uint32_t global_id, int width, int height)
+{
+    WCHAR name[64];
+    ULONG value;
+
+    if (width <= 0 || height <= 0 || width > 0xffff || height > 0xffff) return FALSE;
+    value = MAKELONG(width, height);
+    work_size_property(global_id, name);
+    if (value == HandleToULong(NtUserGetProp(NtUserGetDesktopWindow(), name))) return FALSE;
+    return NtUserSetProp(NtUserGetDesktopWindow(), name, ULongToHandle(value));
+}
+
+BOOL wayland_output_get_work_size(uint32_t global_id, int *width, int *height)
+{
+    WCHAR name[64];
+    ULONG value;
+
+    if (!process_wayland.initialized) return FALSE;
+    work_size_property(global_id, name);
+    if (!(value = HandleToULong(NtUserGetProp(NtUserGetDesktopWindow(), name)))) return FALSE;
+    *width = LOWORD(value);
+    *height = HIWORD(value);
+    return TRUE;
+}
+
 BOOL wayland_output_update_monitor_dpi(uint32_t global_id, UINT dpi)
 {
     WCHAR name[64];
