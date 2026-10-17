@@ -272,6 +272,8 @@ struct wayland_surface_config
     enum wayland_surface_config_state state;
     uint32_t serial;
     BOOL processed;
+    BOOL answers_size_request; /* received after the compositor saw the last client size request */
+    BOOL acked;                /* re-applied config whose serial was already acknowledged */
 };
 
 struct wayland_window_config
@@ -345,7 +347,9 @@ struct wayland_surface
     enum wayland_surface_config_state sent_window_state;
     RECT client_size_request;
     BOOL client_size_pending;
-    unsigned int client_size_retries;
+    struct wl_callback *client_size_sync; /* round trip in flight after a size request */
+    unsigned int client_size_round;       /* 1: first sync in flight, 2: second sync in flight */
+    BOOL client_size_answered;            /* a configure arrived during the second round trip */
     BOOL resizing;
     struct wayland_window_config window;
     int content_width, content_height;

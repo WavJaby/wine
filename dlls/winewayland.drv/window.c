@@ -670,12 +670,10 @@ static void wayland_configure_window(HWND hwnd)
 
     if (surface->client_size_pending)
     {
-        /* A tiled/maximized/fullscreen configure is a size the compositor insists on, not a stale reply. */
-        if (surface->processing.state & (WAYLAND_SURFACE_CONFIG_STATE_TILED | WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
-                                         WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
-            surface->client_size_retries = 3;
+        /* Answers and refusals (client_size_sync_done) end the negotiation; anything else that differs
+         * predates the request. */
         if (!EqualRect(&surface->processing.rect, &surface->client_size_request) &&
-            surface->client_size_retries++ < 3)
+            !surface->processing.answers_size_request && !surface->processing.acked)
         {
             /* A configure for an older size must not overwrite a newer
              * application resize while temporary constraints negotiate it. */

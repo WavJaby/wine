@@ -58,6 +58,11 @@ static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_
         should_post = surface->requested.serial == 0;
         initial_configure = surface->current.serial == 0;
         surface->pending.serial = serial;
+        if (surface->client_size_round == 2)
+        {
+            surface->pending.answers_size_request = TRUE;
+            surface->client_size_answered = TRUE;
+        }
         surface->requested = surface->pending;
         memset(&surface->pending, 0, sizeof(surface->pending));
     }
@@ -299,6 +304,8 @@ err:
  */
 void wayland_surface_destroy(struct wayland_surface *surface)
 {
+    if (surface->client_size_sync) wl_callback_destroy(surface->client_size_sync);
+
     pthread_mutex_lock(&process_wayland.pointer.mutex);
     if (process_wayland.pointer.focused_hwnd == surface->hwnd)
     {
@@ -673,6 +680,75 @@ static void wayland_surface_get_rect_in_monitor(struct wayland_surface *surface,
  *
  * Sets the xdg_surface geometry
  */
+/* Size negotiation answer detection. Requests are processed in order, so after the first sync completes the
+ * compositor has seen the min == max constraints. A compositor that accepts may still send the matching
+ * configure a little later (Hyprland defers configures to its idle loop, right after the sync reply), so a
+ * second round trip bounds the answer. Configures arriving during it are the answer; none means the size
+ * was refused (Hyprland ignores constraints of tiled windows): re-apply the compositor's current size so
+ * Win32 does not keep drawing past it. */
+static void client_size_sync_done(void *data, struct wl_callback *callback, uint32_t serial);
+static const struct wl_callback_listener client_size_sync_listener = { client_size_sync_done };
+
+static void client_size_start_round(struct wayland_surface *surface, unsigned int round)
+{
+    if (surface->client_size_sync) wl_callback_destroy(surface->client_size_sync);
+    surface->client_size_round = round;
+    if (round == 2) surface->client_size_answered = FALSE;
+    surface->client_size_sync = wl_display_sync(process_wayland.wl_display);
+    wl_proxy_set_queue((struct wl_proxy *)surface->client_size_sync, process_wayland.wl_event_queue);
+    wl_callback_add_listener(surface->client_size_sync, &client_size_sync_listener, surface->hwnd);
+}
+
+static void client_size_sync_done(void *data, struct wl_callback *callback, uint32_t serial)
+{
+    struct wayland_win_data *win_data;
+    struct wayland_surface *surface;
+    BOOL post = FALSE;
+    HWND hwnd = data;
+
+    wl_callback_destroy(callback);
+    if (!(win_data = wayland_win_data_get(hwnd))) return;
+    if ((surface = win_data->wayland_surface) && surface->client_size_sync == callback)
+    {
+        surface->client_size_sync = NULL;
+        if (surface->client_size_round == 1) client_size_start_round(surface, 2);
+        else
+        {
+            surface->client_size_round = 0;
+            if (surface->client_size_pending && !surface->client_size_answered)
+            {
+                /* A configure still queued for the window thread is the compositor's latest word: its answer. */
+                if (surface->requested.serial)
+                {
+                    TRACE("hwnd=%p queued configure %s answers client size %s\n", hwnd,
+                          wine_dbgstr_rect(&surface->requested.rect), wine_dbgstr_rect(&surface->client_size_request));
+                    surface->requested.answers_size_request = TRUE;
+                }
+                /* A newer compositor configure is mid-application and supersedes the request. A re-applied
+                 * config (acked) is not newer: it can linger when the fractional round trip is off by a pixel. */
+                else if (surface->processing.serial && !surface->processing.acked)
+                {
+                    TRACE("hwnd=%p configure %s (processed %d) in flight, dropping client size %s\n", hwnd,
+                          wine_dbgstr_rect(&surface->processing.rect), surface->processing.processed,
+                          wine_dbgstr_rect(&surface->client_size_request));
+                    surface->client_size_pending = FALSE;
+                }
+                else
+                {
+                    TRACE("hwnd=%p client size %s refused, keeping %s\n", hwnd,
+                          wine_dbgstr_rect(&surface->client_size_request), wine_dbgstr_rect(&surface->current.rect));
+                    surface->requested = surface->current;
+                    surface->requested.processed = FALSE;
+                    surface->requested.acked = TRUE;
+                    post = TRUE;
+                }
+            }
+        }
+    }
+    wayland_win_data_release(win_data);
+    if (post) NtUserPostMessage(hwnd, WM_WAYLAND_CONFIGURE, 0, 0);
+}
+
 void wayland_surface_request_client_size(struct wayland_surface *surface)
 {
     RECT rect;
@@ -680,12 +756,10 @@ void wayland_surface_request_client_size(struct wayland_surface *surface)
 
     /* Not before the initial configure: min == max on the mapping commit makes compositors (Hyprland) treat
      * the toplevel as fixed-size and float it for good, and the initial configure picks the size anyway.
-     * Not while the compositor holds the window tiled/maximized/fullscreen either: those states dictate the
-     * size, and a negotiated client size would leave Win32 drawing past the tile (cropped right half). */
+     * Configure states cannot tell a tiled window from a floating one (Hyprland 0.56 reports tiled|maximized
+     * for both), so refusal is detected from the compositor's answer instead; see client_size_sync_done. */
     if (!process_wayland.client_window_state || !wayland_surface_is_toplevel(surface) ||
-        surface->window.state || surface->window.minimized || !surface->current.serial ||
-        (surface->current.state & (WAYLAND_SURFACE_CONFIG_STATE_TILED | WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
-                                   WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))) return;
+        surface->window.state || surface->window.minimized || !surface->current.serial) return;
 
     rect = map_rect_to_surface(surface, surface->window.rect);
     OffsetRect(&rect, -rect.left, -rect.top);
@@ -694,10 +768,12 @@ void wayland_surface_request_client_size(struct wayland_surface *surface)
     if (IsRectEmpty(&rect) ||
         (!surface->client_size_pending && EqualRect(&rect, &surface->current.rect)) ||
         (surface->client_size_pending && EqualRect(&rect, &surface->client_size_request))) return;
+    /* The window is applying a compositor configure that is not acknowledged yet: not an application resize. */
+    if (!surface->client_size_pending && surface->processing.serial && EqualRect(&rect, &surface->processing.rect))
+        return;
 
     surface->client_size_request = rect;
     surface->client_size_pending = TRUE;
-    surface->client_size_retries = 0;
     width = rect.right;
     height = rect.bottom;
     TRACE("hwnd=%p requesting client size %dx%d\n", surface->hwnd, width, height);
@@ -707,6 +783,7 @@ void wayland_surface_request_client_size(struct wayland_surface *surface)
     xdg_toplevel_set_min_size(surface->xdg_toplevel, width, height);
     xdg_toplevel_set_max_size(surface->xdg_toplevel, width, height);
     wl_surface_commit(surface->wl_surface);
+    client_size_start_round(surface, 1);
 }
 
 static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface, RECT rect)
@@ -835,7 +912,8 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, REC
     {
         surface->current = surface->processing;
         memset(&surface->processing, 0, sizeof(surface->processing));
-        xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
+        if (!surface->current.acked) xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
+        surface->current.acked = FALSE;
     }
     /* If this is the initial configure, and we have a compatible requested
      * config, use that, in order to draw windows that don't go through the
