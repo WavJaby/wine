@@ -831,8 +831,10 @@ static NTSTATUS portal_call_and_wait(struct portal_context *ctx,
 
     TRACE("portal_call_and_wait: response_received=%d response_code=%u\n",
           ctx->response_received, ctx->response_code);
-	status = (ctx->response_code == 0) ? STATUS_SUCCESS :
-             (ctx->response_code == 1) ? STATUS_CANCELLED : STATUS_INTERNAL_ERROR;
+    /* Any Response means the portal owned the interaction -> non-zero is a cancel, never a fallback trigger.
+     * xdg-desktop-portal-gtk reports Esc / window close as 2, not 1; mapping 2 to an error reopened the request
+     * in Wine's own dialog. Fallback stays for a portal that never answered (errors returned above). */
+    status = ctx->response_code ? STATUS_CANCELLED : STATUS_SUCCESS;
     return status;
 }
 
