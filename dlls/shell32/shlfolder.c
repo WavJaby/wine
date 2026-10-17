@@ -42,6 +42,7 @@
 #include "shlwapi.h"
 #include "wine/debug.h"
 #include "shfldr.h"
+#include "unixlib.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL (shell);
 
@@ -625,6 +626,38 @@ HRESULT WINAPI SHCreateLinks( HWND hWnd, LPCSTR lpszDir, LPDATAOBJECT lpDataObje
     return E_NOTIMPL;
 }
 
+static BOOL WINAPI init_unixlib( INIT_ONCE *once, void *param, void **context )
+{
+    return !__wine_init_unix_call();
+}
+
+/***********************************************************************
+ *  __wine_shell_reveal_in_host (SHELL32.@)
+ *
+ * Show a file or folder selected in the host file manager (XDG portal OpenDirectory).
+ * FALSE -> no portal / no session bus / path outside the Unix filesystem; caller falls back to Wine's explorer.
+ */
+BOOL WINAPI __wine_shell_reveal_in_host( const WCHAR *path )
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    struct reveal_in_host_params *params;
+    char *unix_path;
+    BOOL ret = FALSE;
+
+    TRACE( "%s\n", debugstr_w(path) );
+
+    if (!InitOnceExecuteOnce( &once, init_unixlib, NULL, NULL )) return FALSE;
+    if (!(unix_path = wine_get_unix_file_name( path ))) return FALSE;
+    if (strlen( unix_path ) < sizeof(params->unix_path) && (params = malloc( sizeof(*params) )))
+    {
+        strcpy( params->unix_path, unix_path );
+        ret = !WINE_UNIX_CALL( unix_reveal_in_host, params );
+        free( params );
+    }
+    HeapFree( GetProcessHeap(), 0, unix_path );
+    return ret;
+}
+
 /***********************************************************************
  *  SHOpenFolderAndSelectItems
  *
@@ -640,6 +673,7 @@ HRESULT WINAPI SHOpenFolderAndSelectItems(PCIDLIST_ABSOLUTE pidlFolder, UINT cid
     ITEMIDLIST *pidl_tmp = NULL;
     SHELLEXECUTEINFOW sei = {0};
     COPYDATASTRUCT cds = {0};
+    WCHAR path[MAX_PATH];
     IDispatch *dispatch;
     int timeout = 1000;
     unsigned char *ptr;
@@ -658,6 +692,13 @@ HRESULT WINAPI SHOpenFolderAndSelectItems(PCIDLIST_ABSOLUTE pidlFolder, UINT cid
 
     if (flags & OFASI_EDIT && cidl > 1)
         flags &= ~OFASI_EDIT;
+
+    /* The portal reveals one item and cannot start a rename -> those cases stay in Wine's explorer.
+     * Wine treats apidl entries as absolute (ILFindChild below), so apidl[0] resolves on its own. */
+    if (cidl <= 1 && !(flags & OFASI_EDIT)
+            && SHGetPathFromIDListW(cidl ? apidl[0] : pidlFolder, path)
+            && __wine_shell_reveal_in_host(path))
+        return S_OK;
 
     hr = CoCreateInstance(&CLSID_ShellWindows, NULL, CLSCTX_LOCAL_SERVER, &IID_IShellWindows,
                           (void **)&sw);

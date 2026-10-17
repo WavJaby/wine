@@ -3,6 +3,8 @@ MODULE    = shell32.dll
 IMPORTLIB = shell32
 IMPORTS   = uuid shlwapi user32 gdi32 advapi32
 DELAYIMPORTS = ole32 oleaut32 shdocvw version comctl32 comdlg32 gdiplus
+UNIXLIB   = shell32.so
+UNIX_CFLAGS = $(DBUS_CFLAGS)
 
 VER_PRODUCTVERSION  = 6,0,2900,6242
 VER_OLESELFREGISTER = 1
@@ -100,4 +102,5 @@ SOURCES = \
 	shlview.c \
 	shlview_cmenu.c \
 	shpolicy.c \
-	systray.c
+	systray.c \
+	unixlib.c

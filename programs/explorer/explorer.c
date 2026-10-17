@@ -37,6 +37,9 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(explorer);
 
+/* shell32 Wine extension, not in the SDK headers */
+DECLSPEC_IMPORT BOOL WINAPI __wine_shell_reveal_in_host(const WCHAR *path);
+
 #define EXPLORER_INFO_INDEX 0
 
 #define NAV_TOOLBAR_HEIGHT 30
@@ -924,6 +927,9 @@ int WINAPI wWinMain(HINSTANCE hinstance,
     memset(&parameters,0,sizeof(parameters));
     explorer_hInstance = hinstance;
     parse_command_line(cmdline,&parameters);
+    /* /select -> host file manager first; Wine's own window only when no portal answers. */
+    if (parameters.selection[0] && __wine_shell_reveal_in_host(parameters.selection))
+        ExitProcess(EXIT_SUCCESS);
     hres = OleInitialize(NULL);
     if(FAILED(hres))
     {

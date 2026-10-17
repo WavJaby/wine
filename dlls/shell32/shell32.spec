@@ -493,3 +493,6 @@
 @ stdcall -private StrStrIW(wstr wstr) shlwapi.StrStrIW
 @ stdcall -private StrStrW(wstr wstr) shlwapi.StrStrW
 @ stdcall WOWShellExecute(long str str str str long ptr)
+
+# Wine extensions
+@ stdcall __wine_shell_reveal_in_host(wstr)
