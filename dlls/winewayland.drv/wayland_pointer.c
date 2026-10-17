@@ -28,6 +28,7 @@
 #undef SW_MAX /* Also defined in winuser.rh */
 #include <math.h>
 #include <stdlib.h>
+#include <time.h>
 
 #define OEMRESOURCE
 
@@ -225,6 +226,7 @@ static void pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
     pointer->focused_hwnd = NULL;
     pointer->enter_serial = 0;
     memset(pointer->scroll, 0, sizeof(pointer->scroll));
+    pointer->inertia_active = FALSE;
     pthread_mutex_unlock(&pointer->mutex);
 }
 
@@ -265,6 +267,7 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
     pthread_mutex_lock(&pointer->mutex);
     pointer->button_serial = state == WL_POINTER_BUTTON_STATE_PRESSED ?
                              serial : 0;
+    pointer->inertia_active = FALSE;
     pthread_mutex_unlock(&pointer->mutex);
 
     TRACE("hwnd=%p button=%#x state=%u\n", hwnd, button, state);
@@ -272,34 +275,38 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
     NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, 0);
 }
 
-static void pointer_flush_scroll(void)
+/* Kinetic scrolling for finger (touchpad) axes. Windows synthesizes decaying wheel input after a precision
+ * touchpad lift for applications that only read WM_MOUSEWHEEL (Qt, LINE); Wayland leaves that to the client.
+ * Velocity decays as v(t) = v0 * exp(-t / tau), the iOS-like curve used by most kinetic-scrolling toolkits. */
+static const double inertia_time_constant_ms = 325.0;
+/* Lift-off speed below one wheel notch (10 surface units) per 100 ms reads as a deliberate stop, not a flick. */
+static const double inertia_start_velocity = 10.0 / 100.0;
+/* End once it has decayed below one notch per second; further steps are invisible single-pixel creep. */
+static const double inertia_stop_velocity = 10.0 / 1000.0;
+/* Only samples this close to axis_stop count: a finger that paused before lifting should not fling. */
+static const uint32_t inertia_sample_window_ms = 80;
+/* ~60 Hz steps, one per typical display frame. */
+static const int inertia_step_ms = 16;
+
+static UINT64 monotonic_ms(void)
 {
-    struct wayland_pointer *pointer = &process_wayland.pointer;
-    int deltas[2];
-    HWND hwnd;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (UINT64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Continuous axis units have no universal wheel conversion. Use the conventional ten surface units per wheel
+ * notch, as Qt Wayland does. */
+static double surface_units_to_wheel(double value)
+{
+    return value * WHEEL_DELTA / 10.0;
+}
+
+static void send_scroll(HWND hwnd, const int deltas[2])
+{
     unsigned int axis;
 
-    pthread_mutex_lock(&pointer->mutex);
-    hwnd = pointer->focused_hwnd;
-    for (axis = 0; axis < ARRAY_SIZE(pointer->scroll); ++axis)
-    {
-        /* Continuous axis units have no universal wheel conversion. Use the
-         * conventional ten surface units per wheel notch, as Qt Wayland does.
-         * Discrete/value120 events take precedence over their paired axis. */
-        double value = pointer->scroll[axis].has_value120 ? pointer->scroll[axis].value120 :
-                       pointer->scroll[axis].value * WHEEL_DELTA / 10.0;
-        value += pointer->scroll[axis].remainder;
-        deltas[axis] = value;
-        pointer->scroll[axis].remainder = pointer->scroll[axis].stopped ? 0.0 : value - deltas[axis];
-        pointer->scroll[axis].value = 0.0;
-        pointer->scroll[axis].value120 = 0;
-        pointer->scroll[axis].has_value120 = FALSE;
-        pointer->scroll[axis].stopped = FALSE;
-    }
-    pthread_mutex_unlock(&pointer->mutex);
-
-    if (!hwnd) return;
-    for (axis = 0; axis < ARRAY_SIZE(deltas); ++axis)
+    for (axis = 0; axis < 2; ++axis)
     {
         INPUT input = {.type = INPUT_MOUSE};
         if (!deltas[axis]) continue;
@@ -310,6 +317,131 @@ static void pointer_flush_scroll(void)
     }
 }
 
+/* Mean velocity over the samples inside the window before axis_stop; 0 if the finger rested before lifting. */
+static double lift_velocity(const typeof(process_wayland.pointer.scroll[0]) *scroll)
+{
+    unsigned int i, first = 0, count = 0;
+    double sum = 0.0;
+    uint32_t span;
+
+    for (i = 0; i < scroll->sample_count; ++i)
+    {
+        if (scroll->stop_time - scroll->samples[i].time > inertia_sample_window_ms) continue;
+        if (!count++) first = i;
+        else sum += scroll->samples[i].value; /* the first sample's value accrued before its timestamp */
+    }
+    if (count < 2) return 0.0;
+    if (!(span = scroll->samples[scroll->sample_count - 1].time - scroll->samples[first].time)) return 0.0;
+    return sum / span;
+}
+
+static void pointer_flush_scroll(void)
+{
+    struct wayland_pointer *pointer = &process_wayland.pointer;
+    BOOL fling = FALSE;
+    int deltas[2];
+    HWND hwnd;
+    unsigned int axis;
+
+    pthread_mutex_lock(&pointer->mutex);
+    hwnd = pointer->focused_hwnd;
+    for (axis = 0; axis < ARRAY_SIZE(pointer->scroll); ++axis)
+    {
+        /* Discrete/value120 events take precedence over their paired axis. */
+        double value = pointer->scroll[axis].has_value120 ? pointer->scroll[axis].value120 :
+                       surface_units_to_wheel(pointer->scroll[axis].value);
+        value += pointer->scroll[axis].remainder;
+        deltas[axis] = value;
+        pointer->scroll[axis].remainder = pointer->scroll[axis].stopped ? 0.0 : value - deltas[axis];
+        pointer->scroll[axis].velocity = 0.0;
+        if (pointer->scroll[axis].stopped && pointer->scroll_source == WL_POINTER_AXIS_SOURCE_FINGER)
+        {
+            double velocity = lift_velocity(&pointer->scroll[axis]);
+            if (fabs(velocity) >= inertia_start_velocity)
+            {
+                pointer->scroll[axis].velocity = velocity;
+                fling = TRUE;
+            }
+            pointer->scroll[axis].sample_count = 0;
+        }
+        pointer->scroll[axis].value = 0.0;
+        pointer->scroll[axis].value120 = 0;
+        pointer->scroll[axis].has_value120 = FALSE;
+        pointer->scroll[axis].stopped = FALSE;
+    }
+    if (fling && hwnd)
+    {
+        TRACE("hwnd=%p fling velocity %.3f,%.3f units/ms\n", hwnd,
+              pointer->scroll[0].velocity, pointer->scroll[1].velocity);
+        pointer->inertia_active = TRUE;
+        pointer->inertia_hwnd = hwnd;
+        pointer->inertia_tick = monotonic_ms();
+    }
+    pthread_mutex_unlock(&pointer->mutex);
+
+    if (hwnd) send_scroll(hwnd, deltas);
+}
+
+/* Poll timeout for the event thread: the next inertia step, or -1 (block) when idle. */
+int wayland_pointer_inertia_timeout(void)
+{
+    struct wayland_pointer *pointer = &process_wayland.pointer;
+    UINT64 now, due;
+    int timeout = -1;
+
+    pthread_mutex_lock(&pointer->mutex);
+    if (pointer->inertia_active)
+    {
+        now = monotonic_ms();
+        due = pointer->inertia_tick + inertia_step_ms;
+        timeout = due > now ? due - now : 0;
+    }
+    pthread_mutex_unlock(&pointer->mutex);
+    return timeout;
+}
+
+void wayland_pointer_inertia_step(void)
+{
+    struct wayland_pointer *pointer = &process_wayland.pointer;
+    int deltas[2] = {0};
+    BOOL moving = FALSE;
+    unsigned int axis;
+    UINT64 now;
+    double dt, decay;
+    HWND hwnd;
+
+    pthread_mutex_lock(&pointer->mutex);
+    if (!pointer->inertia_active || (now = monotonic_ms()) < pointer->inertia_tick + inertia_step_ms)
+    {
+        pthread_mutex_unlock(&pointer->mutex);
+        return;
+    }
+    dt = now - pointer->inertia_tick;
+    pointer->inertia_tick = now;
+    decay = exp(-dt / inertia_time_constant_ms);
+    for (axis = 0; axis < ARRAY_SIZE(pointer->scroll); ++axis)
+    {
+        double velocity = pointer->scroll[axis].velocity, value;
+        if (fabs(velocity) < inertia_stop_velocity) continue;
+        /* Distance covered over dt is the integral of v0 * exp(-t / tau). */
+        value = surface_units_to_wheel(velocity * inertia_time_constant_ms * (1.0 - decay));
+        value += pointer->scroll[axis].remainder;
+        deltas[axis] = value;
+        pointer->scroll[axis].remainder = value - deltas[axis];
+        pointer->scroll[axis].velocity = velocity * decay;
+        moving = TRUE;
+    }
+    if (!moving)
+    {
+        pointer->inertia_active = FALSE;
+        for (axis = 0; axis < ARRAY_SIZE(pointer->scroll); ++axis) pointer->scroll[axis].remainder = 0.0;
+    }
+    hwnd = pointer->inertia_hwnd;
+    pthread_mutex_unlock(&pointer->mutex);
+
+    send_scroll(hwnd, deltas);
+}
+
 static void pointer_handle_axis(void *data, struct wl_pointer *wl_pointer,
                                 uint32_t time, uint32_t axis, wl_fixed_t value)
 {
@@ -317,6 +449,21 @@ static void pointer_handle_axis(void *data, struct wl_pointer *wl_pointer,
     if (axis >= ARRAY_SIZE(pointer->scroll)) return;
     pthread_mutex_lock(&pointer->mutex);
     pointer->scroll[axis].value += wl_fixed_to_double(value);
+    if (pointer->inertia_active)
+    {
+        /* A finger touching down again (or a wheel) takes over from the fling. */
+        pointer->inertia_active = FALSE;
+        pointer->scroll[0].velocity = pointer->scroll[1].velocity = 0.0;
+    }
+    if (pointer->scroll_source == WL_POINTER_AXIS_SOURCE_FINGER)
+    {
+        typeof(pointer->scroll[0]) *scroll = &pointer->scroll[axis];
+        if (scroll->sample_count == ARRAY_SIZE(scroll->samples))
+            memmove(scroll->samples, scroll->samples + 1, sizeof(scroll->samples) - sizeof(scroll->samples[0]));
+        else scroll->sample_count++;
+        scroll->samples[scroll->sample_count - 1].time = time;
+        scroll->samples[scroll->sample_count - 1].value = wl_fixed_to_double(value);
+    }
     pthread_mutex_unlock(&pointer->mutex);
     if (wl_pointer_get_version(wl_pointer) < WL_POINTER_FRAME_SINCE_VERSION) pointer_flush_scroll();
 }
@@ -347,6 +494,7 @@ static void pointer_handle_axis_stop(void *data, struct wl_pointer *wl_pointer,
     if (axis >= ARRAY_SIZE(pointer->scroll)) return;
     pthread_mutex_lock(&pointer->mutex);
     pointer->scroll[axis].stopped = TRUE;
+    pointer->scroll[axis].stop_time = time;
     pthread_mutex_unlock(&pointer->mutex);
 }
 
@@ -504,6 +652,7 @@ void wayland_pointer_deinit(void)
     pointer->focused_hwnd = NULL;
     pointer->enter_serial = 0;
     memset(pointer->scroll, 0, sizeof(pointer->scroll));
+    pointer->inertia_active = FALSE;
     pthread_mutex_unlock(&pointer->mutex);
 }
 

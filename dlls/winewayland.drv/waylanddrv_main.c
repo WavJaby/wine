@@ -24,6 +24,8 @@
 
 #include "config.h"
 
+#include <errno.h>
+#include <poll.h>
 #include <stdlib.h>
 
 #include "ntstatus.h"
@@ -104,11 +106,38 @@ err:
     return STATUS_UNSUCCESSFUL;
 }
 
+/* Equivalent of wl_display_dispatch_queue with a poll timeout, so touchpad inertia can step between events. */
 static NTSTATUS waylanddrv_unix_read_events(void *arg)
 {
-    while (wl_display_dispatch_queue(process_wayland.wl_display,
-                                     process_wayland.wl_event_queue) != -1)
-        continue;
+    struct wl_display *display = process_wayland.wl_display;
+    struct wl_event_queue *queue = process_wayland.wl_event_queue;
+    struct pollfd pfd = {.fd = wl_display_get_fd(display), .events = POLLIN};
+    int ret;
+
+    for (;;)
+    {
+        while (wl_display_prepare_read_queue(display, queue) != 0)
+            if (wl_display_dispatch_queue_pending(display, queue) == -1) goto fatal;
+        if (wl_display_flush(display) == -1 && errno != EAGAIN)
+        {
+            wl_display_cancel_read(display);
+            goto fatal;
+        }
+        ret = poll(&pfd, 1, wayland_pointer_inertia_timeout());
+        if (ret > 0)
+        {
+            if (wl_display_read_events(display) == -1) goto fatal;
+        }
+        else
+        {
+            wl_display_cancel_read(display);
+            if (ret < 0 && errno != EINTR) goto fatal;
+        }
+        if (wl_display_dispatch_queue_pending(display, queue) == -1) goto fatal;
+        wayland_pointer_inertia_step();
+    }
+
+fatal:
     /* This function only returns on a fatal error, e.g., if our connection
      * to the Wayland server is lost. */
     return STATUS_UNSUCCESSFUL;

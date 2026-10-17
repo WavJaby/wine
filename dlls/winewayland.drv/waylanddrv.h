@@ -128,8 +128,16 @@ struct wayland_pointer
         int value120;
         BOOL has_value120;
         BOOL stopped;
+        /* Recent finger-scroll samples (compositor ms, surface units) for the lift-off velocity. */
+        struct { uint32_t time; double value; } samples[8];
+        unsigned int sample_count;
+        uint32_t stop_time;
+        double velocity; /* inertia velocity, surface units per ms */
     } scroll[2];
     uint32_t scroll_source;
+    BOOL inertia_active;
+    HWND inertia_hwnd;
+    UINT64 inertia_tick; /* monotonic ms of the last inertia step */
     pthread_mutex_t mutex;
 };
 
@@ -459,6 +467,8 @@ void activate_keyboard_hkl(HWND hwnd, BOOL ime);
 
 void wayland_pointer_init(struct wl_pointer *wl_pointer);
 void wayland_pointer_deinit(void);
+int wayland_pointer_inertia_timeout(void);
+void wayland_pointer_inertia_step(void);
 void wayland_pointer_clear_constraint(void);
 
 
