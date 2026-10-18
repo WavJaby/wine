@@ -43,7 +43,7 @@ extern IActivationFactory *xml_document_factory;
 HRESULT xml_document_create( const WCHAR *xml, IXmlDocument **out );
 HRESULT xml_document_get_xml( IXmlDocument *doc, HSTRING *xml );
 
-HRESULT notification_show( IToastNotification *toast, HSTRING xml, const WCHAR *app_name );
+HRESULT notification_show( IToastNotification *toast, HSTRING xml, HSTRING app_id );
 void notification_hide( IToastNotification *toast );
 void notification_remove( HSTRING tag, HSTRING group, BOOL any_tag, BOOL any_group );
 HRESULT notification_snapshot( IToastNotification ***toasts, UINT32 *count );

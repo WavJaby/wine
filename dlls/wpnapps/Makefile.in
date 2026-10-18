@@ -1,7 +1,7 @@
 MODULE    = wpnapps.dll
 UNIXLIB   = wpnapps.so
 IMPORTLIB = wpnapps
-IMPORTS   = combase uuid
+IMPORTS   = combase uuid advapi32
 UNIX_CFLAGS = $(DBUS_CFLAGS)
 UNIX_LIBS   = $(DBUS_LIBS)
 

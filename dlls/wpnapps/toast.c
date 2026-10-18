@@ -583,16 +583,6 @@ static HRESULT WINAPI notifier_GetTrustLevel( IToastNotifier *iface, TrustLevel 
     return S_OK;
 }
 
-/* Notification server app name: the part of the AppUserModelID after '!' (package app id, e.g. "LINE"),
- * which is also what the desktop's notification daemon maps to a window class. */
-static const WCHAR *app_display_name( HSTRING app_id )
-{
-    const WCHAR *id = WindowsGetStringRawBuffer( app_id, NULL ), *bang;
-
-    if (!id || !id[0]) return L"";
-    return (bang = wcsrchr( id, '!' )) ? bang + 1 : id;
-}
-
 static HRESULT WINAPI notifier_Show( IToastNotifier *iface, IToastNotification *notification )
 {
     struct notifier *impl = impl_from_IToastNotifier( iface );
@@ -615,7 +605,7 @@ static HRESULT WINAPI notifier_Show( IToastNotifier *iface, IToastNotification *
     hr = xml_document_get_xml( content, &xml );
     IXmlDocument_Release( content );
     if (FAILED(hr)) return hr;
-    hr = notification_show( notification, xml, app_display_name( impl->app_id ) );
+    hr = notification_show( notification, xml, impl->app_id );
     WindowsDeleteString( xml );
     return hr;
 }

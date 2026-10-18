@@ -20,6 +20,7 @@
 
 #include "initguid.h"
 #include "private.h"
+#include "notificationactivationcallback.h"
 
 #include "wine/debug.h"
 

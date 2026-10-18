@@ -20,6 +20,8 @@
 #include "unixlib.h"
 
 #include "roapi.h"
+#include "winreg.h"
+#include "notificationactivationcallback.h"
 
 #include "wine/list.h"
 #include "wine/debug.h"
@@ -35,6 +37,7 @@ struct shown
     WCHAR *tag;
     WCHAR *group;
     WCHAR *launch;
+    WCHAR *app_id;  /* AppUserModelID of the notifier, keys the app's toast activator */
     BOOL activated; /* Windows raises Activated, not Dismissed, for a clicked toast */
 };
 
@@ -61,6 +64,7 @@ static void free_shown( struct shown *shown )
     free( shown->tag );
     free( shown->group );
     free( shown->launch );
+    free( shown->app_id );
     free( shown );
 }
 
@@ -260,6 +264,50 @@ static BOOL str_equal( const WCHAR *a, const WCHAR *b )
     return !wcscmp( a ? a : L"", b ? b : L"" );
 }
 
+/* Notification server app name: the part of the AppUserModelID after '!' (package app id, e.g. "LINE"),
+ * which is also what the desktop's notification daemon maps to a window class. */
+static const WCHAR *app_display_name( const WCHAR *app_id )
+{
+    const WCHAR *bang;
+
+    if (!app_id || !app_id[0]) return L"";
+    return (bang = wcsrchr( app_id, '!' )) ? bang + 1 : app_id;
+}
+
+/* Windows hands a desktop app's toast click to the COM class its AUMID registers, from the shortcut property
+ * System.AppUserModel.ToastActivatorCLSID or HKCU\Software\Classes\AppUserModelId\<AUMID> CustomActivator.
+ * Such apps may ignore the in-process Activated event entirely (LINE does). Only the registry source is read:
+ * Wine's shell link does not store shortcut properties. */
+static BOOL get_toast_activator( const WCHAR *app_id, CLSID *clsid )
+{
+    WCHAR key[512], value[40];
+    DWORD size = sizeof(value);
+
+    if (!app_id || !app_id[0]) return FALSE;
+    swprintf( key, ARRAY_SIZE(key), L"Software\\Classes\\AppUserModelId\\%s", app_id );
+    if (RegGetValueW( HKEY_CURRENT_USER, key, L"CustomActivator", RRF_RT_REG_SZ, NULL, value, &size )) return FALSE;
+    return SUCCEEDED(CLSIDFromString( value, clsid ));
+}
+
+/* Called on the MTA event thread; the activator is a local server, usually in the app's own STA. */
+static void invoke_toast_activator( const WCHAR *app_id, const WCHAR *launch )
+{
+    INotificationActivationCallback *callback;
+    CLSID clsid;
+    HRESULT hr;
+
+    if (!get_toast_activator( app_id, &clsid )) return;
+    hr = CoCreateInstance( &clsid, NULL, CLSCTX_LOCAL_SERVER, &IID_INotificationActivationCallback, (void **)&callback );
+    if (FAILED(hr))
+    {
+        WARN( "activator %s for %s: %#lx\n", debugstr_guid( &clsid ), debugstr_w( app_id ), hr );
+        return;
+    }
+    hr = INotificationActivationCallback_Activate( callback, app_id, launch ? launch : L"", NULL, 0 );
+    TRACE( "activator %s, args %s -> %#lx\n", debugstr_guid( &clsid ), debugstr_w( launch ), hr );
+    INotificationActivationCallback_Release( callback );
+}
+
 /* ---- event thread: server signals -> ToastNotification events ---- */
 
 static DWORD WINAPI event_thread( void *arg )
@@ -270,6 +318,7 @@ static DWORD WINAPI event_thread( void *arg )
         struct wait_event_params params = {0};
         IToastNotification *toast = NULL;
         HSTRING launch = NULL;
+        WCHAR *app_id = NULL;
         BOOL dismissed = FALSE;
         struct shown *shown;
 
@@ -285,6 +334,7 @@ static DWORD WINAPI event_thread( void *arg )
                 toast = shown->toast;
                 IToastNotification_AddRef( toast );
                 if (shown->launch) WindowsCreateString( shown->launch, wcslen( shown->launch ), &launch );
+                if (shown->app_id) app_id = wcsdup( shown->app_id );
             }
             else
             {
@@ -303,7 +353,11 @@ static DWORD WINAPI event_thread( void *arg )
 
         if (!toast) continue;
         TRACE( "id %u type %u reason %u\n", params.id, params.type, params.reason );
-        if (params.type == NOTIFICATION_EVENT_ACTIVATED) toast_fire_activated( toast, launch );
+        if (params.type == NOTIFICATION_EVENT_ACTIVATED)
+        {
+            toast_fire_activated( toast, launch );
+            invoke_toast_activator( app_id, WindowsGetStringRawBuffer( launch, NULL ) );
+        }
         else if (dismissed)
         {
             /* freedesktop reasons: 1 expired, 2 dismissed by the user, 3 closed by CloseNotification. */
@@ -313,6 +367,7 @@ static DWORD WINAPI event_thread( void *arg )
             toast_fire_dismissed( toast, reason );
         }
         WindowsDeleteString( launch );
+        free( app_id );
         IToastNotification_Release( toast );
     }
     WARN( "notification event thread exiting\n" );
@@ -344,7 +399,7 @@ static BOOL ensure_bridge(void)
 
 /* ---- API for toast.c ---- */
 
-HRESULT notification_show( IToastNotification *toast, HSTRING xml, const WCHAR *app_name )
+HRESULT notification_show( IToastNotification *toast, HSTRING xml, HSTRING app_id )
 {
     struct notify_params params = {0};
     struct toast_content content;
@@ -364,6 +419,7 @@ HRESULT notification_show( IToastNotification *toast, HSTRING xml, const WCHAR *
     }
     shown->tag = hstring_dup( tag );
     shown->group = hstring_dup( group );
+    shown->app_id = hstring_dup( app_id );
     WindowsDeleteString( tag );
     WindowsDeleteString( group );
 
@@ -384,7 +440,7 @@ HRESULT notification_show( IToastNotification *toast, HSTRING xml, const WCHAR *
             }
     LeaveCriticalSection( &shown_cs );
 
-    app = to_utf8( app_name, FALSE );
+    app = to_utf8( app_display_name( shown->app_id ), FALSE );
     summary = to_utf8( content.summary, FALSE );
     body = to_utf8( content.body, body_markup );
     icon = image_unix_path( content.image );
@@ -407,6 +463,7 @@ HRESULT notification_show( IToastNotification *toast, HSTRING xml, const WCHAR *
         free( shown->tag );
         free( shown->group );
         free( shown->launch );
+        free( shown->app_id );
         free( shown );
         return S_OK; /* a missing server is not the application's failure */
     }
