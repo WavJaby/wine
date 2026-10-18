@@ -846,7 +846,32 @@ static void keyboard_handle_leave(void *data, struct wl_keyboard *wl_keyboard,
      * and for any key repetition to stop. */
     release_all_keys(hwnd);
 
-    /* FIXME: update foreground window as well */
+    /* Foreground is updated on the window thread, see wayland_keyboard_focus_out. */
+    NtUserPostMessage(hwnd, WM_WAYLAND_FOCUS_OUT, 0, 0);
+}
+
+/* Window-thread half of keyboard leave: focus left for a non-Wine surface -> foreground goes to the desktop, as
+ * winex11 focus_out does. Otherwise Win32 keeps reporting the window as foreground after e.g. a workspace switch,
+ * and applications act on it (LINE suppresses its toasts while its main window is foreground).
+ * Runs after the wayland thread dispatched the enter that usually follows a leave, so a move between this process's
+ * surfaces finds focused_hwnd set and keeps the foreground. */
+void wayland_keyboard_focus_out(HWND hwnd)
+{
+    struct wayland_keyboard *keyboard = &process_wayland.keyboard;
+    HWND focused, foreground;
+    DWORD pid;
+
+    pthread_mutex_lock(&keyboard->mutex);
+    focused = keyboard->focused_hwnd;
+    pthread_mutex_unlock(&keyboard->mutex);
+    if (focused || !(foreground = NtUserGetForegroundWindow())) return;
+
+    /* Another Wine process's enter may already have taken the foreground: never take it back. */
+    NtUserGetWindowThread(foreground, &pid);
+    if (pid != GetCurrentProcessId()) return;
+
+    TRACE("keyboard left %p, releasing foreground %p\n", hwnd, foreground);
+    NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
 }
 
 static void send_right_control(HWND hwnd, uint32_t state)
