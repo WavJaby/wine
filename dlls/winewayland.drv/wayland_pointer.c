@@ -123,6 +123,59 @@ static HWND wayland_pointer_get_focused_hwnd(void)
     return hwnd;
 }
 
+/* Windows' SC_MOVE loop moves nothing until the pointer does, so a plain click on a draggable area is harmless there and
+ * apps (LINE) route every press on those areas through it. xdg_toplevel_move grabs the pointer at once and eats the click,
+ * so hold it back until the press turns into a drag. The press stays implicitly grabbed by this surface meanwhile. */
+void wayland_pointer_defer_move(HWND hwnd, uint32_t serial)
+{
+    struct wayland_pointer *pointer = &process_wayland.pointer;
+    SIZE threshold = { NtUserGetSystemMetrics(SM_CXDRAG), NtUserGetSystemMetrics(SM_CYDRAG) };
+
+    pthread_mutex_lock(&pointer->mutex);
+    /* The button may have been released since the caller read the serial. */
+    if (pointer->button_serial == serial)
+    {
+        pointer->deferred_move.hwnd = hwnd;
+        pointer->deferred_move.serial = serial;
+        pointer->deferred_move.origin = pointer->last_pos;
+        pointer->deferred_move.threshold = threshold;
+    }
+    pthread_mutex_unlock(&pointer->mutex);
+}
+
+static void wayland_pointer_track_move(HWND hwnd, POINT pos)
+{
+    struct wayland_pointer *pointer = &process_wayland.pointer;
+    struct wayland_surface *surface;
+    struct wayland_win_data *data;
+    struct wl_seat *wl_seat;
+    uint32_t serial = 0;
+
+    pthread_mutex_lock(&pointer->mutex);
+    pointer->last_pos = pos;
+    if (pointer->deferred_move.hwnd == hwnd &&
+        (abs(pos.x - pointer->deferred_move.origin.x) >= pointer->deferred_move.threshold.cx ||
+         abs(pos.y - pointer->deferred_move.origin.y) >= pointer->deferred_move.threshold.cy))
+    {
+        serial = pointer->deferred_move.serial;
+        pointer->deferred_move.hwnd = NULL;
+    }
+    pthread_mutex_unlock(&pointer->mutex);
+
+    if (!serial || !(data = wayland_win_data_get(hwnd))) return;
+
+    TRACE("hwnd=%p starting deferred move\n", hwnd);
+
+    pthread_mutex_lock(&process_wayland.seat.mutex);
+    wl_seat = process_wayland.seat.wl_seat;
+    if (wl_seat && (surface = data->wayland_surface) && wayland_surface_is_toplevel(surface))
+        xdg_toplevel_move(surface->xdg_toplevel, wl_seat, serial);
+    pthread_mutex_unlock(&process_wayland.seat.mutex);
+    wayland_win_data_release(data);
+
+    wl_display_flush(process_wayland.wl_display);
+}
+
 static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
 {
     INPUT input = {0};
@@ -153,6 +206,8 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
     else if (screen.y < window_rect->top) screen.y = window_rect->top;
 
     wayland_win_data_release(data);
+
+    wayland_pointer_track_move(hwnd, screen);
 
     input.type = INPUT_MOUSE;
     input.mi.dx = screen.x;
@@ -225,6 +280,7 @@ static void pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
     pthread_mutex_lock(&pointer->mutex);
     pointer->focused_hwnd = NULL;
     pointer->enter_serial = 0;
+    pointer->deferred_move.hwnd = NULL;
     memset(pointer->scroll, 0, sizeof(pointer->scroll));
     pointer->inertia_active = FALSE;
     pthread_mutex_unlock(&pointer->mutex);
@@ -267,6 +323,7 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
     pthread_mutex_lock(&pointer->mutex);
     pointer->button_serial = state == WL_POINTER_BUTTON_STATE_PRESSED ?
                              serial : 0;
+    pointer->deferred_move.hwnd = NULL;
     pointer->inertia_active = FALSE;
     pthread_mutex_unlock(&pointer->mutex);
 

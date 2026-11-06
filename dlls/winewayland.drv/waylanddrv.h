@@ -121,6 +121,15 @@ struct wayland_pointer
     uint32_t button_serial;
     struct wayland_cursor cursor;
     double accum_x;
+    POINT last_pos; /* latest motion, in the coordinates sent as hardware input */
+    /* SC_MOVE waiting for the pointer to leave the drag rectangle; hwnd NULL when none. */
+    struct
+    {
+        HWND hwnd;
+        uint32_t serial;
+        POINT origin;
+        SIZE threshold;
+    } deferred_move;
     double accum_y;
     struct
     {
@@ -493,6 +502,7 @@ void wayland_touch_deinit(void);
 
 void wayland_text_input_init(void);
 void wayland_text_input_deinit(void);
+void wayland_pointer_defer_move(HWND hwnd, uint32_t serial);
 
 /**********************************************************************
  *          Wayland data device

@@ -992,7 +992,7 @@ LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT 
             {
                 if (command == SC_MOVE)
                 {
-                    xdg_toplevel_move(surface->xdg_toplevel, wl_seat, button_serial);
+                    wayland_pointer_defer_move(hwnd, button_serial);
                 }
                 else if (command == SC_SIZE)
                 {
