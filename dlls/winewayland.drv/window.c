@@ -947,6 +947,7 @@ void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style)
 void WAYLAND_SetWindowText(HWND hwnd, LPCWSTR text)
 {
     struct wayland_surface *surface;
+    data->layered_lwa = TRUE;
     struct wayland_win_data *data;
 
     TRACE("hwnd=%p text=%s\n", hwnd, wine_dbgstr_w(text));
@@ -1011,6 +1012,7 @@ LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT 
 }
 
 /***********************************************************************
+        data->layered_lwa = FALSE;
  *          WAYLAND_UpdateLayeredWindow
  */
 void WAYLAND_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags)

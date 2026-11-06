@@ -379,7 +379,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
     struct wayland_window_surface *wws = wayland_window_surface_cast(window_surface);
     struct wayland_win_data *data;
     struct wayland_shm_buffer *shm_buffer = NULL, *latest_buffer;
-    BOOL flushed = FALSE;
+    BOOL flushed = FALSE, layered_lwa = FALSE;
     HRGN surface_damage_region = NULL;
     HRGN copy_from_window_region;
     uint32_t buffer_format;
@@ -399,7 +399,19 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface, 
             width = data->rects.visible.right - data->rects.visible.left;
             height = data->rects.visible.bottom - data->rects.visible.top;
         }
+        layered_lwa = data->layered_lwa;
         wayland_win_data_release(data);
+    }
+
+    /* A per-pixel-alpha (UpdateLayeredWindow) window briefly gets a non-layered surface while win32u recreates it
+     * (Qt menus: layered 1 -> 0 -> 1 on every show). Its pixels are unpainted, so presenting it flashed white or black;
+     * and as an XRGB frame it made Hyprland 0.56 keep the surface opaque for good -- it reuses a same-size shm texture
+     * without refreshing the opaque flag on format change -> the translucent shadow margin drew black. Present nothing.
+     * SetLayeredWindowAttributes windows are excluded: their non-layered surface is the real content. */
+    if (!wws->layered && !layered_lwa && (NtUserGetWindowLongW(window_surface->hwnd, GWL_EXSTYLE) & WS_EX_LAYERED))
+    {
+        TRACE("hwnd %p: skipping non-layered surface of a per-pixel layered window\n", window_surface->hwnd);
+        goto done;
     }
 
     surface_damage_region = NtGdiCreateRectRgn(rect->left + dirty->left, rect->top + dirty->top,
