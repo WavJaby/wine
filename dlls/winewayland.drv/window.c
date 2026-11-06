@@ -273,7 +273,8 @@ static void reapply_cursor_clipping(void)
     NtUserSetThreadDpiAwarenessContext(context);
 }
 
-static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data, struct wayland_surface *owner_surface)
+static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data, struct wayland_surface *owner_surface,
+                                                    BOOL popup)
 {
     struct wayland_surface *surface;
     enum wayland_surface_role role;
@@ -296,7 +297,8 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
         visible = FALSE;
 
     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
-    else if (owner_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+    /* A subsurface owner has no xdg_surface to parent a popup: stays confined to that owner. */
+    else if (owner_surface) role = popup && owner_surface->xdg_surface ? WAYLAND_SURFACE_ROLE_POPUP : WAYLAND_SURFACE_ROLE_SUBSURFACE;
     else role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
 
     /* we can temporarily clear the role of a surface but cannot assign a different one after it's set */
@@ -333,6 +335,9 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
         break;
     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
         wayland_surface_make_subsurface(surface, owner_surface);
+        break;
+    case WAYLAND_SURFACE_ROLE_POPUP:
+        wayland_surface_make_popup(surface, owner_surface, &data->rects.visible);
         break;
     }
 
@@ -426,6 +431,8 @@ static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
          * we use the config fields to mark them as updated. */
         surface->processing.serial = 1;
         surface->processing.processed = TRUE;
+        break;
+    case WAYLAND_SURFACE_ROLE_POPUP:
         break;
     }
 
@@ -550,14 +557,17 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const str
  * owner, so nothing tells the compositor it is not an application window and tiling compositors tile it.
  * Parent it to the process's frontmost unowned non-tool toplevel: xdg parents are what compositors use to
  * float and stack auxiliary windows. Owned windows are subsurfaces and unaffected. */
+static BOOL is_unowned_toolwindow(HWND hwnd)
+{
+    if (!(NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) return FALSE;
+    if (NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_CHILD) return FALSE;
+    return !NtUserGetWindowRelative(hwnd, GW_OWNER);
+}
+
 static HWND find_toolwindow_parent(HWND hwnd)
 {
     DWORD pid, self = GetCurrentProcessId();
     HWND w;
-
-    if (!(NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) return 0;
-    if (NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_CHILD) return 0;
-    if (NtUserGetWindowRelative(hwnd, GW_OWNER)) return 0;
 
     for (w = NtUserGetWindowRelative(hwnd, GW_HWNDFIRST); w; w = NtUserGetWindowRelative(w, GW_HWNDNEXT))
     {
@@ -571,16 +581,51 @@ static HWND find_toolwindow_parent(HWND hwnd)
     return 0;
 }
 
+/* A menu-like popup shown while the pointer is on none of this process's surfaces was opened from outside the app --
+ * a tray icon menu (Qt activates it, which is why it is managed rather than an owned subsurface). Its Win32
+ * position means nothing to Wayland, so only the compositor can place it. It keeps an xdg parent (floats and centers
+ * on the main window, as before, wherever nothing else applies) and gets an xdg tag naming the role, which a compositor
+ * rule can act on (Hyprland: match xdg_tag, move to the cursor). Dropping the parent instead got it tiled on tiling
+ * compositors without a rule. */
+static const char detached_popup_tag[] = "wine-detached-popup";
+
+/* The same popup opened from inside the app has a meaningful Win32 position, but being activated it reads as managed and
+ * its owner is hidden, so it became a toplevel the compositor centered: it must be an xdg_popup of the window under the
+ * pointer. A subsurface instead got cut off at that window's edge on Hyprland. */
+
+/* Topmost activatable captionless popup with nothing on screen to anchor it. Styles only: Qt's class and tool-window bits
+ * are not stable (LINE 26.6 menus lost CS_SAVEBITS + WS_EX_TOOLWINDOW and gained a hidden owner). WS_EX_NOACTIVATE keeps
+ * out LINE's splash, the missing WS_EX_TOPMOST its launcher banner: both open with the pointer elsewhere, must stay centered. */
+static BOOL is_menu_like_popup(HWND hwnd)
+{
+    DWORD style = NtUserGetWindowLongW(hwnd, GWL_STYLE), ex_style = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
+    HWND owner = NtUserGetWindowRelative(hwnd, GW_OWNER);
+
+    if (!(style & WS_POPUP) || (style & (WS_CHILD | WS_CAPTION))) return FALSE;
+    if (!(ex_style & WS_EX_TOPMOST) || (ex_style & WS_EX_NOACTIVATE)) return FALSE;
+    return !owner || !(NtUserGetWindowLongW(owner, GWL_STYLE) & WS_VISIBLE);
+}
+
+static HWND pointer_focused_window(void)
+{
+    HWND focused;
+
+    pthread_mutex_lock(&process_wayland.pointer.mutex);
+    focused = process_wayland.pointer.focused_hwnd;
+    pthread_mutex_unlock(&process_wayland.pointer.mutex);
+    return focused;
+}
+
 /***********************************************************************
  *           WAYLAND_WindowPosChanged
  */
 void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                               const struct window_rects *new_rects, struct window_surface *surface)
 {
-    HWND owner = NtUserGetAncestor(hwnd, GA_ROOT), tool_parent;
+    HWND owner = NtUserGetAncestor(hwnd, GA_ROOT), tool_parent, popup_anchor = 0;
     struct wayland_surface *owner_surface;
     struct wayland_win_data *data, *owner_data, *parent_data;
-    BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
+    BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN, tool = FALSE, detached = FALSE, popup;
 
     TRACE("hwnd %p new_rects %s after %p flags %08x\n", hwnd, debugstr_window_rects(new_rects), insert_after, swp_flags);
 
@@ -588,9 +633,27 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
      * may need to query win_data information about other HWNDs and thus
      * acquire the lock itself internally. */
     if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) owner = owner_hint;
-    tool_parent = surface ? find_toolwindow_parent(hwnd) : 0;
+    if (surface)
+    {
+        tool = is_unowned_toolwindow(hwnd);
+        if (is_menu_like_popup(hwnd)) detached = !(popup_anchor = pointer_focused_window());
+    }
+    tool_parent = tool || detached ? find_toolwindow_parent(hwnd) : 0;
 
     if (!(data = wayland_win_data_get(hwnd))) return;
+    /* A detached popup stays a toplevel. Once no longer the active window it reads as unmanaged, and became a
+     * subsurface of the window under its stale Win32 position: the tray menu jumped into the main window, clipped. */
+    if (data->wayland_surface && wayland_surface_is_toplevel(data->wayland_surface) &&
+        data->wayland_surface->toplevel_detached)
+    {
+        owner = 0;
+        popup_anchor = 0;
+    }
+    /* Latched like the detached state: once mapped the pointer enters the popup itself, or leaves the process. */
+    popup = popup_anchor || (data->wayland_surface && data->wayland_surface->role == WAYLAND_SURFACE_ROLE_POPUP &&
+                             data->wayland_surface->xdg_popup);
+    if (popup && data->wayland_surface && data->wayland_surface->owner_hwnd) owner = data->wayland_surface->owner_hwnd;
+    else if (popup_anchor) owner = popup_anchor;
     owner_data = owner && owner != hwnd ? wayland_win_data_get(owner) : NULL;
     owner_surface = owner_data ? owner_data->wayland_surface : NULL;
 
@@ -607,9 +670,21 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
             data->wayland_surface = NULL;
         }
     }
-    else if (wayland_win_data_create_wayland_surface(data, owner_surface))
+    else if (wayland_win_data_create_wayland_surface(data, owner_surface, popup))
     {
         struct wayland_surface *wayland_surface = data->wayland_surface;
+
+        if (wayland_surface_is_toplevel(wayland_surface) && !wayland_surface->toplevel_placed)
+        {
+            /* Decided once per role: after mapping, the pointer enters the popup itself. */
+            wayland_surface->toplevel_placed = TRUE;
+            wayland_surface->toplevel_detached = detached;
+            TRACE("hwnd=%p tool %d detached %d class style %#x ex %#x\n", hwnd, tool, wayland_surface->toplevel_detached,
+                  (UINT)NtUserGetClassLongW(hwnd, GCL_STYLE), (UINT)NtUserGetWindowLongW(hwnd, GWL_EXSTYLE));
+            if (wayland_surface->toplevel_detached && process_wayland.xdg_toplevel_tag_manager_v1)
+                xdg_toplevel_tag_manager_v1_set_toplevel_tag(process_wayland.xdg_toplevel_tag_manager_v1,
+                                                             wayland_surface->xdg_toplevel, detached_popup_tag);
+        }
 
         if (wayland_surface_is_toplevel(wayland_surface) && wayland_surface->toplevel_parent != tool_parent)
         {
@@ -872,6 +947,7 @@ void WAYLAND_SetLayeredWindowAttributes(HWND hwnd, COLORREF key, BYTE alpha, DWO
     if ((surface = data->wayland_surface))
         wayland_surface_set_opacity(surface, alpha, flags);
     data->layered_attribs_set = TRUE;
+    data->layered_lwa = TRUE;
 
     wayland_win_data_release(data);
 }
@@ -936,6 +1012,7 @@ void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style)
         if ((surface = data->wayland_surface))
             wayland_surface_set_opacity(surface, 0, 0);
         data->layered_attribs_set = FALSE;
+        data->layered_lwa = FALSE;
     }
 
     wayland_win_data_release(data);
@@ -947,7 +1024,6 @@ void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style)
 void WAYLAND_SetWindowText(HWND hwnd, LPCWSTR text)
 {
     struct wayland_surface *surface;
-    data->layered_lwa = TRUE;
     struct wayland_win_data *data;
 
     TRACE("hwnd=%p text=%s\n", hwnd, wine_dbgstr_w(text));
@@ -1012,7 +1088,6 @@ LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT 
 }
 
 /***********************************************************************
-        data->layered_lwa = FALSE;
  *          WAYLAND_UpdateLayeredWindow
  */
 void WAYLAND_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags)

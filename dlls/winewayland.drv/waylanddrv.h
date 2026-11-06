@@ -38,6 +38,7 @@
 #include "xdg-shell-client-protocol.h"
 #include "wlr-data-control-unstable-v1-client-protocol.h"
 #include "xdg-toplevel-icon-v1-client-protocol.h"
+#include "xdg-toplevel-tag-v1-client-protocol.h"
 #include "pointer-warp-v1-client-protocol.h"
 #include "alpha-modifier-v1-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
@@ -87,6 +88,7 @@ enum wayland_surface_role
     WAYLAND_SURFACE_ROLE_NONE,
     WAYLAND_SURFACE_ROLE_TOPLEVEL,
     WAYLAND_SURFACE_ROLE_SUBSURFACE,
+    WAYLAND_SURFACE_ROLE_POPUP,
 };
 
 struct wayland_keyboard
@@ -119,8 +121,6 @@ struct wayland_pointer
     BOOL pending_warp;
     uint32_t enter_serial;
     uint32_t button_serial;
-    struct wayland_cursor cursor;
-    double accum_x;
     POINT last_pos; /* latest motion, in the coordinates sent as hardware input */
     /* SC_MOVE waiting for the pointer to leave the drag rectangle; hwnd NULL when none. */
     struct
@@ -130,6 +130,8 @@ struct wayland_pointer
         POINT origin;
         SIZE threshold;
     } deferred_move;
+    struct wayland_cursor cursor;
+    double accum_x;
     double accum_y;
     struct
     {
@@ -227,6 +229,7 @@ struct wayland
     struct zwlr_data_control_manager_v1 *zwlr_data_control_manager_v1;
     struct wl_data_device_manager *wl_data_device_manager;
     struct xdg_toplevel_icon_manager_v1 *xdg_toplevel_icon_manager_v1;
+    struct xdg_toplevel_tag_manager_v1 *xdg_toplevel_tag_manager_v1;
     struct wp_cursor_shape_manager_v1 *wp_cursor_shape_manager_v1;
     struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
     struct wp_alpha_modifier_v1 *wp_alpha_modifier_v1;
@@ -336,19 +339,27 @@ struct wayland_surface
     struct wayland_shm_buffer *big_icon_buffer;
 
     enum wayland_surface_role role;
+    struct xdg_surface *xdg_surface; /* toplevel and popup */
+    HWND owner_hwnd; /* subsurface and popup */
     union
     {
         struct
         {
-            struct xdg_surface *xdg_surface;
             struct xdg_toplevel *xdg_toplevel;
             struct xdg_toplevel_icon_v1 *xdg_toplevel_icon;
             HWND toplevel_parent; /* window last passed to xdg_toplevel_set_parent */
+            BOOL toplevel_placed; /* detached-popup decision taken; latched because pointer focus moves once mapped */
+            BOOL toplevel_detached; /* opened while the pointer was off this process: tagged, never a subsurface */
         };
         struct
         {
             struct wl_subsurface *wl_subsurface;
-            HWND owner_hwnd;
+        };
+        struct
+        {
+            struct xdg_popup *xdg_popup;
+            RECT popup_rect; /* last rect given to the positioner, owner surface coordinates */
+            BOOL popup_configured;
         };
     };
     struct wp_alpha_modifier_surface_v1 *wp_alpha_modifier_surface_v1;
@@ -394,6 +405,8 @@ uint32_t wayland_output_get_surface_scale(uint32_t global_id);
 struct wayland_surface *wayland_surface_create(HWND hwnd);
 void wayland_surface_destroy(struct wayland_surface *surface);
 void wayland_surface_make_toplevel(struct wayland_surface *surface, const RECT *window_rect);
+void wayland_surface_make_popup(struct wayland_surface *surface, struct wayland_surface *owner,
+                                const RECT *window_rect);
 void wayland_surface_make_subsurface(struct wayland_surface *surface,
                                      struct wayland_surface *parent);
 void wayland_surface_clear_role(struct wayland_surface *surface);
@@ -453,6 +466,7 @@ struct wayland_win_data
     BOOL resizeable;
     BOOL managed;
     BOOL layered_attribs_set;
+    BOOL layered_lwa; /* layered through SetLayeredWindowAttributes: its non-layered surface carries the real content */
     BOOL monitor_change_pending;
 };
 
@@ -466,7 +480,6 @@ struct wayland_client_surface *get_client_surface(HWND hwnd);
 void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
 BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
 struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
-    BOOL layered_lwa; /* layered through SetLayeredWindowAttributes: its non-layered surface carries the real content */
 void wayland_window_init(void);
 
 /**********************************************************************
@@ -489,6 +502,7 @@ void wayland_pointer_deinit(void);
 int wayland_pointer_inertia_timeout(void);
 void wayland_pointer_inertia_step(void);
 void wayland_pointer_clear_constraint(void);
+void wayland_pointer_defer_move(HWND hwnd, uint32_t serial);
 
 
 /**********************************************************************
@@ -503,7 +517,6 @@ void wayland_touch_deinit(void);
 
 void wayland_text_input_init(void);
 void wayland_text_input_deinit(void);
-void wayland_pointer_defer_move(HWND hwnd, uint32_t serial);
 
 /**********************************************************************
  *          Wayland data device

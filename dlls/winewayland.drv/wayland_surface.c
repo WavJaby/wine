@@ -66,6 +66,14 @@ static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_
         surface->requested = surface->pending;
         memset(&surface->pending, 0, sizeof(surface->pending));
     }
+    else if (surface && surface->role == WAYLAND_SURFACE_ROLE_POPUP && surface->xdg_surface == xdg_surface)
+    {
+        /* The Win32 rect stays as is even if the compositor slid the popup on screen: pointer input is surface relative. */
+        initial_configure = !surface->popup_configured;
+        surface->popup_configured = TRUE;
+        xdg_surface_ack_configure(xdg_surface, serial);
+        if (!initial_configure) wl_surface_commit(surface->wl_surface);
+    }
 
     wayland_win_data_release(data);
 
@@ -141,6 +149,28 @@ static const struct xdg_toplevel_listener xdg_toplevel_listener =
 {
     xdg_toplevel_handle_configure,
     xdg_toplevel_handle_close
+};
+
+static void xdg_popup_handle_configure(void *data, struct xdg_popup *xdg_popup,
+                                       int32_t x, int32_t y, int32_t width, int32_t height)
+{
+    TRACE("hwnd=%p %d,%d %dx%d\n", data, x, y, width, height);
+}
+
+static void xdg_popup_handle_popup_done(void *data, struct xdg_popup *xdg_popup)
+{
+    NtUserPostMessage((HWND)data, WM_SYSCOMMAND, SC_CLOSE, 0);
+}
+
+static void xdg_popup_handle_repositioned(void *data, struct xdg_popup *xdg_popup, uint32_t token)
+{
+}
+
+static const struct xdg_popup_listener xdg_popup_listener =
+{
+    xdg_popup_handle_configure,
+    xdg_popup_handle_popup_done,
+    xdg_popup_handle_repositioned
 };
 
 static void surface_handle_enter(void *user_data, struct wl_surface *wl_surface, struct wl_output *wl_output)
@@ -403,6 +433,8 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface, const RECT *
     wayland_surface_clear_role(surface);
     surface->role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
     surface->toplevel_parent = 0;
+    surface->toplevel_placed = FALSE;
+    surface->toplevel_detached = FALSE;
 
     surface->xdg_surface =
         xdg_wm_base_get_xdg_surface(process_wayland.xdg_wm_base, surface->wl_surface);
@@ -434,6 +466,72 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface, const RECT *
 err:
     wayland_surface_clear_role(surface);
     ERR("Failed to assign toplevel role to wayland surface\n");
+}
+
+static RECT popup_rect_in_owner(struct wayland_surface *owner, const RECT *window_rect)
+{
+    RECT rect = *window_rect;
+
+    OffsetRect(&rect, -owner->window.rect.left, -owner->window.rect.top);
+    return map_rect_to_surface(owner, rect);
+}
+
+/* Anchored at the rect's corner, as Win32 already chose the position: the compositor only slides it back on screen. */
+static struct xdg_positioner *popup_positioner_create(const RECT *rect)
+{
+    struct xdg_positioner *positioner = xdg_wm_base_create_positioner(process_wayland.xdg_wm_base);
+
+    xdg_positioner_set_size(positioner, max(rect->right - rect->left, 1), max(rect->bottom - rect->top, 1));
+    xdg_positioner_set_anchor_rect(positioner, rect->left, rect->top, 1, 1);
+    xdg_positioner_set_anchor(positioner, XDG_POSITIONER_ANCHOR_TOP_LEFT);
+    xdg_positioner_set_gravity(positioner, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+    xdg_positioner_set_constraint_adjustment(positioner, XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
+                                                         XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y);
+    return positioner;
+}
+
+/**********************************************************************
+ *          wayland_surface_make_popup
+ *
+ * Gives the xdg_popup role to a plain wayland surface. Unlike a subsurface a popup is not confined to its owner's
+ * window, so a menu near the edge stays whole. No grab: closing on an outside click stays Win32 activation's job.
+ */
+void wayland_surface_make_popup(struct wayland_surface *surface, struct wayland_surface *owner,
+                                const RECT *window_rect)
+{
+    struct xdg_positioner *positioner;
+
+    assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_POPUP);
+    if (surface->xdg_popup && surface->owner_hwnd == owner->hwnd) return;
+
+    wayland_surface_clear_role(surface);
+    surface->role = WAYLAND_SURFACE_ROLE_POPUP;
+
+    TRACE("surface=%p owner=%p\n", surface, owner);
+
+    surface->xdg_surface = xdg_wm_base_get_xdg_surface(process_wayland.xdg_wm_base, surface->wl_surface);
+    if (!surface->xdg_surface) goto err;
+    xdg_surface_add_listener(surface->xdg_surface, &xdg_surface_listener, surface->hwnd);
+
+    surface->popup_rect = popup_rect_in_owner(owner, window_rect);
+    surface->popup_configured = FALSE;
+    positioner = popup_positioner_create(&surface->popup_rect);
+    surface->xdg_popup = xdg_surface_get_popup(surface->xdg_surface, owner->xdg_surface, positioner);
+    xdg_positioner_destroy(positioner);
+    if (!surface->xdg_popup) goto err;
+    xdg_popup_add_listener(surface->xdg_popup, &xdg_popup_listener, surface->hwnd);
+
+    surface->owner_hwnd = owner->hwnd;
+    wayland_surface_init_fractional_scale(surface, owner->window.scale);
+
+    wl_surface_commit(surface->wl_surface);
+    wl_display_flush(process_wayland.wl_display);
+
+    return;
+
+err:
+    wayland_surface_clear_role(surface);
+    ERR("Failed to assign popup role to wayland surface\n");
 }
 
 /**********************************************************************
@@ -533,6 +631,23 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
             surface->wl_subsurface = NULL;
         }
 
+        surface->owner_hwnd = NULL;
+        break;
+
+    case WAYLAND_SURFACE_ROLE_POPUP:
+        if (surface->xdg_popup)
+        {
+            xdg_popup_destroy(surface->xdg_popup);
+            surface->xdg_popup = NULL;
+        }
+
+        if (surface->xdg_surface)
+        {
+            xdg_surface_destroy(surface->xdg_surface);
+            surface->xdg_surface = NULL;
+        }
+
+        surface->popup_configured = FALSE;
         surface->owner_hwnd = NULL;
         break;
     }
@@ -974,6 +1089,34 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
     wayland_win_data_release(owner_data);
 }
 
+/* Nothing may be attached before the first configure. */
+static BOOL wayland_surface_reconfigure_popup(struct wayland_surface *surface)
+{
+    struct xdg_positioner *positioner;
+    struct wayland_win_data *owner_data;
+    RECT rect;
+
+    if (!surface->popup_configured) return FALSE;
+    if (xdg_popup_get_version(surface->xdg_popup) < XDG_POPUP_REPOSITION_SINCE_VERSION) return TRUE;
+    if (!(owner_data = wayland_win_data_get(surface->owner_hwnd))) return TRUE;
+
+    if (owner_data->wayland_surface)
+    {
+        rect = popup_rect_in_owner(owner_data->wayland_surface, &surface->window.rect);
+        if (!EqualRect(&rect, &surface->popup_rect))
+        {
+            TRACE("hwnd=%p rect=%s\n", surface->hwnd, wine_dbgstr_rect(&rect));
+            positioner = popup_positioner_create(&rect);
+            xdg_popup_reposition(surface->xdg_popup, positioner, 0);
+            xdg_positioner_destroy(positioner);
+            surface->popup_rect = rect;
+        }
+    }
+
+    wayland_win_data_release(owner_data);
+    return TRUE;
+}
+
 /**********************************************************************
  *          wayland_surface_reconfigure
  *
@@ -1001,6 +1144,10 @@ BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
         if (!surface->wl_subsurface) break; /* surface role has been cleared */
         wayland_surface_reconfigure_subsurface(surface);
+        break;
+    case WAYLAND_SURFACE_ROLE_POPUP:
+        if (!surface->xdg_popup) break; /* surface role has been cleared */
+        if (!wayland_surface_reconfigure_popup(surface)) return FALSE;
         break;
     }
 

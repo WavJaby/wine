@@ -128,10 +128,11 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
     else if (strcmp(interface, "xdg_wm_base") == 0)
     {
         /* Bind version 2 so that compositors (e.g., sway) can properly send tiled
-         * states, instead of falling back to (ab)using the maximized state. */
+         * states, instead of falling back to (ab)using the maximized state.
+         * Version 3 adds xdg_popup.reposition. */
         process_wayland.xdg_wm_base =
             wl_registry_bind(registry, id, &xdg_wm_base_interface,
-                             version < 2 ? version : 2);
+                             version < 3 ? version : 3);
         xdg_wm_base_add_listener(process_wayland.xdg_wm_base, &xdg_wm_base_listener, NULL);
     }
     else if (strcmp(interface, "wl_shm") == 0)
@@ -200,6 +201,11 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
     {
         process_wayland.xdg_toplevel_icon_manager_v1 =
             wl_registry_bind(registry, id, &xdg_toplevel_icon_manager_v1_interface, 1);
+    }
+    else if (strcmp(interface, "xdg_toplevel_tag_manager_v1") == 0)
+    {
+        process_wayland.xdg_toplevel_tag_manager_v1 =
+            wl_registry_bind(registry, id, &xdg_toplevel_tag_manager_v1_interface, 1);
     }
     else if (strcmp(interface, "wp_cursor_shape_manager_v1") == 0)
     {
