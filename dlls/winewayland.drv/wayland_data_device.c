@@ -63,6 +63,9 @@ static const WCHAR pngW[] = {'P','N','G',0};
 static const WCHAR jfifW[] = {'J','F','I','F',0};
 static const WCHAR gifW[] = {'G','I','F',0};
 static const WCHAR image_svg_xmlW[] = {'i','m','a','g','e','/','s','v','g','+','x','m','l',0};
+static const WCHAR image_pngW[] = {'i','m','a','g','e','/','p','n','g',0};
+static const WCHAR image_jpegW[] = {'i','m','a','g','e','/','j','p','e','g',0};
+static const WCHAR image_bmpW[] = {'i','m','a','g','e','/','b','m','p',0};
 
 /* Normalize the MIME type string by skipping inconsequential characters,
  * such as spaces and double quotes, and convert to lower case. */
@@ -220,6 +223,10 @@ static struct data_device_format supported_formats[] =
     {"image/png", 0, pngW, export_data, import_data},
     {"image/jpeg", 0, jfifW, export_data, import_data},
     {"image/gif", 0, gifW, export_data, import_data},
+    /* Qt registers these formats under their MIME names. Imports use the entries above, as the first match wins. */
+    {"image/png", 0, image_pngW, export_data, import_data},
+    {"image/jpeg", 0, image_jpegW, export_data, import_data},
+    {"image/bmp", 0, image_bmpW, export_data, import_data},
     {"image/svg+xml", 0, image_svg_xmlW, export_data, import_data},
     {"application/x-riff", CF_RIFF, NULL, export_data, import_data},
     {"audio/wav", CF_WAVE, NULL, export_data, import_data},
@@ -261,6 +268,20 @@ static struct data_device_format *data_device_format_for_mime_type(const char *m
     for (format = supported_formats; format->mime_type; ++format)
     {
         if (!strcmp(mime, format->mime_type)) return format;
+    }
+
+    return NULL;
+}
+
+/* Several clipboard formats can share a MIME type: export the one the clipboard actually holds. */
+static struct data_device_format *data_device_format_for_export(const char *mime)
+{
+    struct data_device_format *format;
+
+    for (format = supported_formats; format->mime_type; ++format)
+    {
+        if (!strcmp(mime, format->mime_type) && NtUserIsClipboardFormatAvailable(format->clipboard_format))
+            return format;
     }
 
     return NULL;
@@ -320,7 +341,7 @@ static void data_control_source_send(void *data,
     const char *normalized;
 
     if ((normalized = normalize_mime_type(mime_type)) &&
-        (format = data_device_format_for_mime_type(normalized)))
+        (format = data_device_format_for_export(normalized)))
     {
         wayland_data_source_export(format, fd);
     }
@@ -608,7 +629,7 @@ static void data_source_send(void *data, struct wl_data_source *source,
     const char *normalized;
 
     if ((normalized = normalize_mime_type(mime_type)) &&
-        (format = data_device_format_for_mime_type(normalized)))
+        (format = data_device_format_for_export(normalized)))
     {
         wayland_data_source_export(format, fd);
     }
