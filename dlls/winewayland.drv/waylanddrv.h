@@ -470,6 +470,7 @@ struct wayland_win_data
     BOOL managed;
     BOOL layered_attribs_set;
     BOOL layered_lwa; /* layered through SetLayeredWindowAttributes: its non-layered surface carries the real content */
+    BOOL ex_layered; /* WS_EX_LAYERED cache: surface flush runs under the window surface lock and must not call win32u */
     BOOL monitor_change_pending;
 };
 

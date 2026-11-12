@@ -72,6 +72,8 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
 
     data->hwnd = hwnd;
     data->rects = *rects;
+    /* Read before win_data_mutex: win32u calls take its user lock. Kept current by WAYLAND_SetWindowStyle. */
+    data->ex_layered = !!(NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED);
 
     pthread_mutex_lock(&win_data_mutex);
 
@@ -1008,6 +1010,8 @@ void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style)
 
     if (hwnd == NtUserGetDesktopWindow()) return;
     if (!(data = wayland_win_data_get(hwnd))) return;
+
+    if (offset == GWL_EXSTYLE) data->ex_layered = !!(style->styleNew & WS_EX_LAYERED);
 
     /* Changing WS_EX_LAYERED resets attributes */
     if (offset == GWL_EXSTYLE && (changed & WS_EX_LAYERED))
