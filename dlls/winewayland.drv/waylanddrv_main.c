@@ -37,6 +37,7 @@ char *process_name = NULL;
 static const struct user_driver_funcs waylanddrv_funcs =
 {
     .pActivateWindow = WAYLAND_ActivateWindow,
+    .pGetMaximumTouches = WAYLAND_GetMaximumTouches,
     .pClipboardWindowProc = WAYLAND_ClipboardWindowProc,
     .pClipCursor = WAYLAND_ClipCursor,
     .pDesktopWindowProc = WAYLAND_DesktopWindowProc,

@@ -281,3 +281,11 @@ void wayland_touch_deinit(void)
         free(point);
     }
 }
+
+/* wl_touch has no contact limit to report; 10 is what multi-touch panels commonly advertise. */
+#define WAYLAND_TOUCH_CONTACTS 10
+
+UINT WAYLAND_GetMaximumTouches(void)
+{
+    return process_wayland.touch.wl_touch ? WAYLAND_TOUCH_CONTACTS : 0;
+}

@@ -928,6 +928,11 @@ static void nulldrv_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_h
 {
 }
 
+static UINT nulldrv_GetMaximumTouches(void)
+{
+    return 0;
+}
+
 static BOOL nulldrv_SystemParametersInfo( UINT action, UINT int_param, void *ptr_param, UINT flags )
 {
     return FALSE;
@@ -1268,6 +1273,11 @@ static LRESULT loaderdrv_WintabProc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
     return load_driver()->pWintabProc( hwnd, msg, wparam, lparam, buffer );
 }
 
+static UINT loaderdrv_GetMaximumTouches(void)
+{
+    return load_driver()->pGetMaximumTouches();
+}
+
 static UINT loaderdrv_VulkanInit( UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs )
 {
     return load_driver()->pVulkanInit( version, vulkan_handle, driver_funcs );
@@ -1348,6 +1358,7 @@ static const struct user_driver_funcs lazy_load_driver =
     nulldrv_WindowPosChanged,
     /* system parameters */
     nulldrv_SystemParametersInfo,
+    loaderdrv_GetMaximumTouches,
     /* wintab support */
     loaderdrv_WintabProc,
     /* vulkan support */
@@ -1448,6 +1459,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     SET_USER_FUNC(MoveWindowBits);
     SET_USER_FUNC(WindowPosChanged);
     SET_USER_FUNC(SystemParametersInfo);
+    SET_USER_FUNC(GetMaximumTouches);
     SET_USER_FUNC(WintabProc);
     SET_USER_FUNC(VulkanInit);
     SET_USER_FUNC(OpenGLInit);

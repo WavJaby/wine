@@ -7271,6 +7271,12 @@ int get_system_metrics( int index )
     case SM_TABLETPC:
     case SM_MEDIACENTER:
         return 0;
+    case SM_DIGITIZER:
+        /* Toolkits create their touch device from this (Qt handles no touch input without it). */
+        if (!(ret = user_driver->pGetMaximumTouches())) return 0;
+        return NID_INTEGRATED_TOUCH | NID_READY | (ret > 1 ? NID_MULTI_INPUT : 0);
+    case SM_MAXIMUMTOUCHES:
+        return user_driver->pGetMaximumTouches();
     case SM_CMETRICS:
         return SM_CMETRICS;
     default:
