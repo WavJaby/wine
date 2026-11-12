@@ -539,6 +539,21 @@ static void master_socket_poll_event( struct fd *fd, int event )
         socklen_t len = sizeof(dummy);
         int client = accept( get_unix_fd( master_socket->fd ), (struct sockaddr *) &dummy, &len );
         if (client == -1) return;
+#ifdef SO_PEERCRED
+        {
+            /* a peer in a sibling pid namespace (one sandbox instance per launch) reports pid 0: it reports its own pid numbers
+             * and we would signal whatever owns them here, possibly ourselves. Child processes inherit the namespace of a
+             * parent that passed this check, so the connecting processes are the only entry point. */
+            struct ucred cred;
+            socklen_t cred_len = sizeof(cred);
+            if (!getsockopt( client, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len ) && !cred.pid)
+            {
+                fprintf( stderr, "wineserver: rejecting a client from another pid namespace\n" );
+                close( client );
+                return;
+            }
+        }
+#endif
         fcntl( client, F_SETFL, O_NONBLOCK );
         if ((process = create_process( client, NULL, 0, NULL, NULL, NULL, 0, NULL )))
         {
