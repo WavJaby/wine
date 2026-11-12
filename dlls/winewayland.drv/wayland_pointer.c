@@ -185,6 +185,7 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
     struct wayland_surface *surface;
     struct wayland_win_data *data;
 
+    InterlockedExchangePointer((void **)&process_wayland.touch.last_hwnd, NULL);
     if (!(hwnd = wayland_pointer_get_focused_hwnd())) return;
     if (!(data = wayland_win_data_get(hwnd))) return;
     if (!(surface = data->wayland_surface))
@@ -295,6 +296,7 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
     HWND hwnd;
 
     InterlockedExchange(&process_wayland.input_serial, serial);
+    InterlockedExchangePointer((void **)&process_wayland.touch.last_hwnd, NULL);
 
     if (!(hwnd = wayland_pointer_get_focused_hwnd())) return;
 

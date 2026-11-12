@@ -111,6 +111,7 @@ static void touch_handle_down(void *private, struct wl_touch *wl_touch,
     }
     point->id = id;
     point->focused_hwnd = hwnd;
+    InterlockedExchangePointer((void **)&touch->last_hwnd, hwnd);
     wl_list_init(&point->link);
     wayland_touch_point_to_window(surface, wl_fixed_to_double(x),
                                   wl_fixed_to_double(y),

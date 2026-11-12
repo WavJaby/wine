@@ -167,6 +167,7 @@ struct wayland_touch
 {
     struct wl_touch *wl_touch;
     struct wl_list touch_points;
+    HWND last_hwnd; /* window of the latest contact, until the pointer is used again; interlocked */
 };
 
 struct wayland_text_input
@@ -231,9 +232,9 @@ struct wayland
     struct wl_data_device_manager *wl_data_device_manager;
     struct xdg_toplevel_icon_manager_v1 *xdg_toplevel_icon_manager_v1;
     struct xdg_toplevel_tag_manager_v1 *xdg_toplevel_tag_manager_v1;
+    struct xdg_activation_v1 *xdg_activation_v1;
     struct wp_cursor_shape_manager_v1 *wp_cursor_shape_manager_v1;
     struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
-    struct xdg_activation_v1 *xdg_activation_v1;
     struct wp_alpha_modifier_v1 *wp_alpha_modifier_v1;
     struct wayland_seat seat;
     struct wayland_keyboard keyboard;
@@ -561,11 +562,10 @@ void WAYLAND_SetLayeredWindowAttributes(HWND hwnd, COLORREF key, BYTE alpha, DWO
 void WAYLAND_SetWindowIcons(HWND hwnd, HICON icon, const ICONINFO *ii, HICON icon_small, const ICONINFO *ii_small);
 void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style);
 void WAYLAND_SetWindowText(HWND hwnd, LPCWSTR text);
-LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *pos);
 void WAYLAND_ActivateWindow(HWND hwnd, HWND previous);
 UINT WAYLAND_GetMaximumTouches(void);
+LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *pos);
 void WAYLAND_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags);
-void WAYLAND_ActivateWindow(HWND hwnd, HWND previous);
 UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manager, void *param);
 LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,

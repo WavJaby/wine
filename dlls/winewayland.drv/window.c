@@ -606,10 +606,13 @@ static BOOL is_menu_like_popup(HWND hwnd)
     return !owner || !(NtUserGetWindowLongW(owner, GWL_STYLE) & WS_VISIBLE);
 }
 
-static HWND pointer_focused_window(void)
+/* Window the user is pointing at: the one last touched while the pointer has stayed idle since, else the one under
+ * the pointer. A press-and-hold menu opens after the finger lifts, with the pointer parked anywhere. */
+static HWND pointing_input_window(void)
 {
-    HWND focused;
+    HWND focused = InterlockedCompareExchangePointer((void **)&process_wayland.touch.last_hwnd, NULL, NULL);
 
+    if (focused && NtUserIsWindow(focused)) return focused;
     pthread_mutex_lock(&process_wayland.pointer.mutex);
     focused = process_wayland.pointer.focused_hwnd;
     pthread_mutex_unlock(&process_wayland.pointer.mutex);
@@ -636,7 +639,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     if (surface)
     {
         tool = is_unowned_toolwindow(hwnd);
-        if (is_menu_like_popup(hwnd)) detached = !(popup_anchor = pointer_focused_window());
+        if (is_menu_like_popup(hwnd)) detached = !(popup_anchor = pointing_input_window());
     }
     tool_parent = tool || detached ? find_toolwindow_parent(hwnd) : 0;
 
@@ -1036,9 +1039,6 @@ void WAYLAND_SetWindowText(HWND hwnd, LPCWSTR text)
     }
 }
 
-/***********************************************************************
- *          WAYLAND_SysCommand
- */
 static void xdg_activation_token_handle_done(void *private, struct xdg_activation_token_v1 *token, const char *value)
 {
     struct wayland_surface *surface;
@@ -1096,6 +1096,9 @@ void WAYLAND_ActivateWindow(HWND hwnd, HWND previous)
     wayland_win_data_release(data);
 }
 
+/***********************************************************************
+ *          WAYLAND_SysCommand
+ */
 LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *pos)
 {
     LRESULT ret = -1;
