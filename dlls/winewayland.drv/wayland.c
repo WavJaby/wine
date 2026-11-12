@@ -299,10 +299,11 @@ BOOL wayland_process_init(void)
     const char *client_window_state = getenv("WINEWAYLAND_CLIENT_WINDOW_STATE");
     const char *auto_monitor_dpi = getenv("WINEWAYLAND_AUTO_MONITOR_DPI");
 
-    /* Experimental compatibility mode for decoration-only maximize states.
-     * Geometry constraints still apply, but Win32 owns its maximize style. */
-    process_wayland.client_window_state = client_window_state && !strcmp(client_window_state, "1");
-    process_wayland.auto_monitor_dpi = auto_monitor_dpi && !strcmp(auto_monitor_dpi, "1");
+    /* Both default on; "0" opts out.
+     * client_window_state: decoration-only maximize states; geometry constraints still apply, but Win32 owns its
+     * maximize style. auto_monitor_dpi: per-monitor Win32 DPI follows each output's Wayland scale (96 * scale). */
+    process_wayland.client_window_state = !client_window_state || strcmp(client_window_state, "0");
+    process_wayland.auto_monitor_dpi = !auto_monitor_dpi || strcmp(auto_monitor_dpi, "0");
 
     process_wayland.wl_display = wl_display_connect(NULL);
     if (!process_wayland.wl_display)
