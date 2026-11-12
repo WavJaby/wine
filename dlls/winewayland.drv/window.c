@@ -804,7 +804,7 @@ static void wayland_configure_window(HWND hwnd)
                   wine_dbgstr_rect(&surface->client_size_request), wine_dbgstr_rect(&surface->processing.rect));
             surface->current = surface->processing;
             memset(&surface->processing, 0, sizeof(surface->processing));
-            xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
+            wayland_surface_ack_configure(surface, surface->current.serial);
             /* A restore may have applied constraints while still maximized.
              * Commit them again now that the normal configure was received. */
             wl_surface_commit(surface->wl_surface);
@@ -884,8 +884,7 @@ static void wayland_configure_window(HWND hwnd)
         TRACE("hwnd=%p restoring from minimize\n", hwnd);
         surface->current = surface->processing;
         memset(&surface->processing, 0, sizeof(surface->processing));
-        xdg_surface_ack_configure(surface->xdg_surface,
-                                  surface->current.serial);
+        wayland_surface_ack_configure(surface, surface->current.serial);
         wayland_win_data_release(data);
         send_message(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
         return;

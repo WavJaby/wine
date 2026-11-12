@@ -377,6 +377,8 @@ struct wayland_surface
     BOOL resizing;
     struct wayland_window_config window;
     int content_width, content_height;
+    int geometry_width, geometry_height; /* last xdg window geometry size sent */
+    uint32_t acked_serial;               /* newest configure serial acknowledged, 0 before the first */
     HCURSOR hcursor;
 };
 
@@ -418,6 +420,7 @@ void wayland_surface_attach_shm(struct wayland_surface *surface,
                                 HRGN surface_damage_region);
 BOOL wayland_surface_reconfigure(struct wayland_surface *surface);
 void wayland_surface_request_client_size(struct wayland_surface *surface);
+void wayland_surface_ack_configure(struct wayland_surface *surface, uint32_t serial);
 BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf, RECT rect,
                                           enum wayland_surface_config_state state);
 RECT map_rect_to_surface(struct wayland_surface *surface, RECT rect);

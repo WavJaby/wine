@@ -35,6 +35,15 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
+/* Single route for toplevel acks. The event thread acknowledges size-preserving configures ahead of the window
+ * thread, which later reaches the same or an older serial: acking those again is a protocol error. */
+void wayland_surface_ack_configure(struct wayland_surface *surface, uint32_t serial)
+{
+    if (surface->acked_serial && (int32_t)(serial - surface->acked_serial) <= 0) return;
+    xdg_surface_ack_configure(surface->xdg_surface, serial);
+    surface->acked_serial = serial;
+}
+
 static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_surface,
                                          uint32_t serial)
 {
@@ -65,6 +74,20 @@ static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_
         }
         surface->requested = surface->pending;
         memset(&surface->pending, 0, sizeof(surface->pending));
+
+        /* A configure for the size already committed needs no new content, so acknowledge it here instead of at
+         * the next flush. That flush never comes while the application neither repaints nor reads its queue
+         * (UpdateLayeredWindow menus, launcher splash screens), and Hyprland scales a surface by window size /
+         * acked size: still acked at the initial tiled size, such a window showed only its top-left corner.
+         * The window thread still applies the states from WM_WAYLAND_CONFIGURE. */
+        if (!initial_configure && surface->geometry_width &&
+            surface->requested.rect.right == surface->geometry_width &&
+            surface->requested.rect.bottom == surface->geometry_height)
+        {
+            TRACE("hwnd=%p acknowledging size-preserving configure %u\n", hwnd, serial);
+            wayland_surface_ack_configure(surface, serial);
+            wl_surface_commit(surface->wl_surface);
+        }
     }
     else if (surface && surface->role == WAYLAND_SURFACE_ROLE_POPUP && surface->xdg_surface == xdg_surface)
     {
@@ -671,6 +694,9 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
 
     surface->content_width = 0;
     surface->content_height = 0;
+    surface->geometry_width = 0;
+    surface->geometry_height = 0;
+    surface->acked_serial = 0;
 
     wl_display_flush(process_wayland.wl_display);
 }
@@ -950,6 +976,8 @@ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface
         xdg_surface_set_window_geometry(surface->xdg_surface,
                                         rect.left, rect.top,
                                         width, height);
+        surface->geometry_width = width;
+        surface->geometry_height = height;
         if (surface->client_size_pending)
         {
             xdg_toplevel_set_min_size(surface->xdg_toplevel, surface->client_size_request.right,
@@ -1033,7 +1061,7 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, REC
     {
         surface->current = surface->processing;
         memset(&surface->processing, 0, sizeof(surface->processing));
-        if (!surface->current.acked) xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
+        if (!surface->current.acked) wayland_surface_ack_configure(surface, surface->current.serial);
         surface->current.acked = FALSE;
     }
     /* If this is the initial configure, and we have a compatible requested
@@ -1045,7 +1073,7 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface, REC
     {
         surface->current = surface->requested;
         memset(&surface->requested, 0, sizeof(surface->requested));
-        xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
+        wayland_surface_ack_configure(surface, surface->current.serial);
     }
     else if (!surface->current.serial ||
              !wayland_surface_config_is_compatible(&surface->current, rect,
