@@ -2489,7 +2489,92 @@ struct pointer
     user_handle_t win;
     int primary;
     union hw_input input;
+    int start_x, start_y;      /* where the contact began */
+    unsigned int start_time;   /* tick count when it began */
+    int dragging;              /* moved past the tap tolerance: the left button is held for it */
 };
+
+/* Mouse messages promoted from a touch contact, as Windows produces them for a window that leaves WM_POINTER* to
+ * DefWindowProc. Measured with InjectTouchInput on Windows 11 (26300) at 96 DPI:
+ *   contact kept within the tolerance, lifted before the hold time -> left click on lift
+ *   same, lifted after the hold time -> right click on lift (press and hold)
+ *   moved past the tolerance -> left button down at the start position, moves, up on lift
+ * Nothing is sent while a contact rests. Hold: 464 ms gave a left click, 490 ms a right click. Tolerance: 10 px stayed a
+ * tap, drags began at 10.4-11 px. The 0x80 bit of the extra info tells touch from pen. */
+#define TOUCH_MOUSE_EXTRA_INFO   0xff515780
+#define TOUCH_HOLD_TIME_MS       480
+#define TOUCH_TAP_TOLERANCE_96   11
+
+static int touch_tap_tolerance( struct desktop *desktop, int x, int y )
+{
+    struct winstation *winstation = desktop->winstation;
+    unsigned int i;
+
+    for (i = 0; i < winstation->monitor_count; i++)
+    {
+        const struct monitor_info *monitor = &winstation->monitors[i];
+        if (x < monitor->virt.left || x >= monitor->virt.right || y < monitor->virt.top || y >= monitor->virt.bottom) continue;
+        if (!monitor->dpi.num || !monitor->dpi.den) break;
+        return TOUCH_TAP_TOLERANCE_96 * monitor->dpi.num / (monitor->dpi.den * 96);
+    }
+    return TOUCH_TAP_TOLERANCE_96;
+}
+
+static void queue_touch_mouse_message( struct desktop *desktop, user_handle_t win, unsigned int message, int x, int y,
+                                       unsigned int time )
+{
+    struct hw_msg_source source = { IMDT_UNAVAILABLE, IMDT_TOUCH };
+    struct message *msg;
+
+    if (!(msg = alloc_hardware_message( TOUCH_MOUSE_EXTRA_INFO, source, time, 0 ))) return;
+    msg->win    = get_user_full_handle( win );
+    msg->msg    = message;
+    msg->wparam = 0;
+    msg->lparam = 0;
+    msg->x      = x;
+    msg->y      = y;
+    if (!send_hook_ll_message( desktop, msg, WH_MOUSE_LL, 0, NULL )) queue_hardware_message( desktop, msg, 0 );
+}
+
+static void promote_touch_to_mouse( struct pointer *pointer, unsigned int message, int x, int y, unsigned int time )
+{
+    struct desktop *desktop = pointer->desktop;
+    user_handle_t win = pointer->win;
+
+    if (message == WM_POINTERDOWN)
+    {
+        pointer->start_x = x;
+        pointer->start_y = y;
+        pointer->start_time = time;
+        pointer->dragging = 0;
+        return;
+    }
+
+    if (!pointer->dragging && message == WM_POINTERUPDATE)
+    {
+        int tolerance = touch_tap_tolerance( desktop, pointer->start_x, pointer->start_y );
+        if (abs( x - pointer->start_x ) < tolerance && abs( y - pointer->start_y ) < tolerance) return;
+        pointer->dragging = 1;
+        queue_touch_mouse_message( desktop, win, WM_MOUSEMOVE, pointer->start_x, pointer->start_y, time );
+        queue_touch_mouse_message( desktop, win, WM_LBUTTONDOWN, pointer->start_x, pointer->start_y, time );
+    }
+
+    if (message == WM_POINTERUPDATE)
+    {
+        queue_touch_mouse_message( desktop, win, WM_MOUSEMOVE, x, y, time );
+        return;
+    }
+
+    /* WM_POINTERUP */
+    if (pointer->dragging) queue_touch_mouse_message( desktop, win, WM_LBUTTONUP, x, y, time );
+    else
+    {
+        int hold = time - pointer->start_time >= TOUCH_HOLD_TIME_MS;
+        queue_touch_mouse_message( desktop, win, WM_MOUSEMOVE, x, y, time );
+        queue_touch_mouse_message( desktop, win, hold ? WM_RBUTTONDOWN : WM_LBUTTONDOWN, x, y, time );
+        queue_touch_mouse_message( desktop, win, hold ? WM_RBUTTONUP : WM_LBUTTONUP, x, y, time );
+    }
+}
 
 static void queue_pointer_message( struct pointer *pointer, int repeated );
 
@@ -2538,22 +2623,7 @@ static void queue_pointer_message( struct pointer *pointer, int repeated )
         queue_hardware_message( desktop, msg, 1 );
     }
 
-    if (!repeated && pointer->primary && (msg = alloc_hardware_message( 0xff515700, source, time, 0 )))
-    {
-        unsigned int message = WM_MOUSEMOVE;
-        if (input->hw.msg == WM_POINTERDOWN) message = WM_LBUTTONDOWN;
-        else if (input->hw.msg == WM_POINTERUP) message = WM_LBUTTONUP;
-
-        msg->win       = get_user_full_handle( win );
-        msg->msg       = message;
-        msg->wparam    = 0;
-        msg->lparam    = 0;
-        msg->x         = x;
-        msg->y         = y;
-
-        if (!send_hook_ll_message( desktop, msg, WH_MOUSE_LL, 0, NULL ))
-            queue_hardware_message( desktop, msg, 0 );
-    }
+    if (!repeated && pointer->primary) promote_touch_to_mouse( pointer, input->hw.msg, x, y, time );
 
     if (input->hw.msg != WM_POINTERUP)
     {
@@ -2579,6 +2649,9 @@ static struct pointer *find_pointer_from_id( struct desktop *desktop, unsigned i
     pointer->timeout = NULL;
     pointer->desktop = desktop;
     pointer->primary = list_empty( &desktop->pointers );
+    pointer->start_x = pointer->start_y = 0;
+    pointer->start_time = 0;
+    pointer->dragging = 0;
     list_add_tail( &desktop->pointers, &pointer->entry );
 
     return pointer;

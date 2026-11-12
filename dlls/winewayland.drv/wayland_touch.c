@@ -77,6 +77,11 @@ static WORD allocate_pointer_id(void)
     return 0;
 }
 
+/* What Windows reports for a finger on the screen: a contact is the first button held, and an injected or
+ * palm-rejected digitizer contact carries CONFIDENCE. Toolkits read button state from these, not from the message. */
+#define TOUCH_CONTACT_FLAGS (POINTER_MESSAGE_FLAG_INRANGE | POINTER_MESSAGE_FLAG_INCONTACT | \
+                             POINTER_MESSAGE_FLAG_FIRSTBUTTON | POINTER_MESSAGE_FLAG_CONFIDENCE)
+
 static void touch_handle_down(void *private, struct wl_touch *wl_touch,
 		                      uint32_t serial, uint32_t time,
 					          struct wl_surface *wl_surface, int32_t id,
@@ -118,9 +123,7 @@ static void touch_handle_down(void *private, struct wl_touch *wl_touch,
     input.type = INPUT_HARDWARE;
     input.hi.uMsg = WM_POINTERDOWN;
     input.hi.wParamL = point->pointer_id;
-    input.hi.wParamH = POINTER_MESSAGE_FLAG_INRANGE |
-                       POINTER_MESSAGE_FLAG_INCONTACT |
-                       POINTER_MESSAGE_FLAG_NEW;
+    input.hi.wParamH = TOUCH_CONTACT_FLAGS | POINTER_MESSAGE_FLAG_NEW;
 
     NtUserSendHardwareInput(hwnd, 0, &input, point->xy);
     wl_list_insert(&touch->touch_points, &point->link);
@@ -206,8 +209,7 @@ static void touch_handle_motion(void *private, struct wl_touch *wl_touch,
     input.type = INPUT_HARDWARE;
     input.hi.uMsg = WM_POINTERUPDATE;
     input.hi.wParamL = point->pointer_id;
-    input.hi.wParamH = POINTER_MESSAGE_FLAG_INRANGE |
-                       POINTER_MESSAGE_FLAG_INCONTACT;
+    input.hi.wParamH = TOUCH_CONTACT_FLAGS;
 
     NtUserSendHardwareInput(point->focused_hwnd, 0, &input, point->xy);
 }
