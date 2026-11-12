@@ -1039,6 +1039,63 @@ void WAYLAND_SetWindowText(HWND hwnd, LPCWSTR text)
 /***********************************************************************
  *          WAYLAND_SysCommand
  */
+static void xdg_activation_token_handle_done(void *private, struct xdg_activation_token_v1 *token, const char *value)
+{
+    struct wayland_surface *surface;
+    struct wayland_win_data *data;
+
+    if ((data = wayland_win_data_get(private)))
+    {
+        if ((surface = data->wayland_surface) && wayland_surface_is_toplevel(surface))
+            xdg_activation_v1_activate(process_wayland.xdg_activation_v1, value, surface->wl_surface);
+        wayland_win_data_release(data);
+    }
+
+    xdg_activation_token_v1_destroy(token);
+    wl_display_flush(process_wayland.wl_display);
+}
+
+static const struct xdg_activation_token_v1_listener xdg_activation_token_listener =
+{
+    xdg_activation_token_handle_done
+};
+
+/***********************************************************************
+ *          WAYLAND_ActivateWindow
+ *
+ * An app bringing itself forward (LINE opening a chat from a toast click) changes only the Win32 foreground; without
+ * keyboard focus the compositor knows nothing of it. Whether the request is honored stays the compositor's policy.
+ */
+void WAYLAND_ActivateWindow(HWND hwnd, HWND previous)
+{
+    struct xdg_activation_token_v1 *token;
+    struct wayland_win_data *data;
+    uint32_t serial;
+    HWND focused;
+
+    if (!process_wayland.xdg_activation_v1) return;
+
+    pthread_mutex_lock(&process_wayland.keyboard.mutex);
+    focused = process_wayland.keyboard.focused_hwnd;
+    pthread_mutex_unlock(&process_wayland.keyboard.mutex);
+    if (focused == hwnd) return;
+
+    if (!(data = wayland_win_data_get(hwnd))) return;
+    if (data->wayland_surface && wayland_surface_is_toplevel(data->wayland_surface))
+    {
+        TRACE("hwnd=%p previous=%p focused=%p\n", hwnd, previous, focused);
+        token = xdg_activation_v1_get_activation_token(process_wayland.xdg_activation_v1);
+        xdg_activation_token_v1_add_listener(token, &xdg_activation_token_listener, hwnd);
+        pthread_mutex_lock(&process_wayland.seat.mutex);
+        if (process_wayland.seat.wl_seat && (serial = InterlockedCompareExchange(&process_wayland.input_serial, 0, 0)))
+            xdg_activation_token_v1_set_serial(token, serial, process_wayland.seat.wl_seat);
+        pthread_mutex_unlock(&process_wayland.seat.mutex);
+        xdg_activation_token_v1_commit(token);
+        wl_display_flush(process_wayland.wl_display);
+    }
+    wayland_win_data_release(data);
+}
+
 LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *pos)
 {
     LRESULT ret = -1;

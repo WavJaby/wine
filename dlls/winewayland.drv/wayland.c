@@ -207,6 +207,11 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         process_wayland.xdg_toplevel_tag_manager_v1 =
             wl_registry_bind(registry, id, &xdg_toplevel_tag_manager_v1_interface, 1);
     }
+    else if (strcmp(interface, "xdg_activation_v1") == 0)
+    {
+        process_wayland.xdg_activation_v1 =
+            wl_registry_bind(registry, id, &xdg_activation_v1_interface, 1);
+    }
     else if (strcmp(interface, "wp_cursor_shape_manager_v1") == 0)
     {
         process_wayland.wp_cursor_shape_manager_v1 =

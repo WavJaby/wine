@@ -38,6 +38,7 @@
 #include "xdg-shell-client-protocol.h"
 #include "wlr-data-control-unstable-v1-client-protocol.h"
 #include "xdg-toplevel-icon-v1-client-protocol.h"
+#include "xdg-activation-v1-client-protocol.h"
 #include "xdg-toplevel-tag-v1-client-protocol.h"
 #include "pointer-warp-v1-client-protocol.h"
 #include "alpha-modifier-v1-client-protocol.h"
@@ -232,6 +233,7 @@ struct wayland
     struct xdg_toplevel_tag_manager_v1 *xdg_toplevel_tag_manager_v1;
     struct wp_cursor_shape_manager_v1 *wp_cursor_shape_manager_v1;
     struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
+    struct xdg_activation_v1 *xdg_activation_v1;
     struct wp_alpha_modifier_v1 *wp_alpha_modifier_v1;
     struct wayland_seat seat;
     struct wayland_keyboard keyboard;
@@ -561,6 +563,7 @@ void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style);
 void WAYLAND_SetWindowText(HWND hwnd, LPCWSTR text);
 LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *pos);
 void WAYLAND_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags);
+void WAYLAND_ActivateWindow(HWND hwnd, HWND previous);
 UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manager, void *param);
 LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
