@@ -476,7 +476,8 @@ struct wayland_win_data
 
 struct wayland_win_data *wayland_win_data_get(HWND hwnd);
 void wayland_win_data_release(struct wayland_win_data *data);
-void wayland_win_data_post_monitor_change(struct wayland_win_data *data);
+HWND wayland_win_data_mark_monitor_change(struct wayland_win_data *data);
+void wayland_post_monitor_change(HWND hwnd);
 void wayland_windows_update_monitors(void);
 void wayland_windows_remove_output(uint32_t global_id);
 

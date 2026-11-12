@@ -178,6 +178,7 @@ static void surface_handle_enter(void *user_data, struct wl_surface *wl_surface,
     struct wayland_win_data *data;
     struct wayland_output *output = wl_output ? wl_output_get_user_data(wl_output) : NULL;
     struct wayland_surface *surface;
+    HWND post = 0;
     uint32_t *id;
 
     if (!process_wayland.auto_monitor_dpi || !output || !(data = wayland_win_data_get(user_data))) return;
@@ -186,10 +187,11 @@ static void surface_handle_enter(void *user_data, struct wl_surface *wl_surface,
         wl_array_for_each(id, &surface->entered_outputs)
             if (*id == output->global_id) goto done;
         if ((id = wl_array_add(&surface->entered_outputs, sizeof(*id)))) *id = output->global_id;
-        wayland_win_data_post_monitor_change(data);
+        post = wayland_win_data_mark_monitor_change(data);
     }
 done:
     wayland_win_data_release(data);
+    wayland_post_monitor_change(post);
 }
 
 static void surface_handle_leave(void *user_data, struct wl_surface *wl_surface, struct wl_output *wl_output)
@@ -197,6 +199,7 @@ static void surface_handle_leave(void *user_data, struct wl_surface *wl_surface,
     struct wayland_win_data *data;
     struct wayland_output *output = wl_output ? wl_output_get_user_data(wl_output) : NULL;
     struct wayland_surface *surface;
+    HWND post = 0;
     uint32_t *id;
 
     if (!process_wayland.auto_monitor_dpi || !output || !(data = wayland_win_data_get(user_data))) return;
@@ -209,9 +212,10 @@ static void surface_handle_leave(void *user_data, struct wl_surface *wl_surface,
             surface->entered_outputs.size -= sizeof(*id);
             break;
         }
-        wayland_win_data_post_monitor_change(data);
+        post = wayland_win_data_mark_monitor_change(data);
     }
     wayland_win_data_release(data);
+    wayland_post_monitor_change(post);
 }
 
 static const struct wl_surface_listener surface_listener =
@@ -227,7 +231,7 @@ void wp_fractional_scale_handle_scale(void* user_data,
     struct wayland_win_data *data;
     struct wayland_surface *surface;
     double scale = scale_fixed / 120.0;
-    HWND hwnd = user_data;
+    HWND hwnd = user_data, post;
 
     TRACE("hwnd=%p scale=%lf\n", hwnd, scale);
 
@@ -238,10 +242,11 @@ void wp_fractional_scale_handle_scale(void* user_data,
         return;
     }
     surface->has_preferred_scale = TRUE;
-    wayland_win_data_post_monitor_change(data);
+    post = wayland_win_data_mark_monitor_change(data);
     if (scale == surface->window.scale)
     {
         wayland_win_data_release(data);
+        wayland_post_monitor_change(post);
         return;
     }
 
@@ -260,6 +265,7 @@ void wp_fractional_scale_handle_scale(void* user_data,
     }
 
     wayland_win_data_release(data);
+    wayland_post_monitor_change(post);
 
     NtUserExposeWindowSurface(hwnd, 0, NULL);
 }

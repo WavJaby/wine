@@ -135,22 +135,61 @@ void wayland_win_data_release(struct wayland_win_data *data)
     pthread_mutex_unlock(&win_data_mutex);
 }
 
-/* Caller holds win_data_mutex; callbacks are deferred to the owning GUI thread. */
-void wayland_win_data_post_monitor_change(struct wayland_win_data *data)
+/* Caller holds win_data_mutex. Only marks the change: returns the hwnd the caller must pass to
+ * wayland_post_monitor_change() after releasing the mutex, or 0 when nothing is to be posted. */
+HWND wayland_win_data_mark_monitor_change(struct wayland_win_data *data)
 {
     if (!process_wayland.auto_monitor_dpi || data->monitor_change_pending ||
-        !data->wayland_surface || !wayland_surface_is_toplevel(data->wayland_surface)) return;
-    data->monitor_change_pending = NtUserPostMessage(data->hwnd, WM_WAYLAND_MONITOR_CHANGED, 0, 0);
+        !data->wayland_surface || !wayland_surface_is_toplevel(data->wayland_surface)) return 0;
+    data->monitor_change_pending = TRUE;
+    return data->hwnd;
+}
+
+/* Must be called without win_data_mutex: NtUserPostMessage takes win32u's user lock, and a GUI thread holding that
+ * lock can wait for driver locks (window_surface_set_shape -> surface lock), so posting under win_data_mutex from the
+ * event thread deadlocks a second Wine process at its first window. Callbacks run on the owning GUI thread. */
+void wayland_post_monitor_change(HWND hwnd)
+{
+    struct wayland_win_data *data;
+
+    if (!hwnd || NtUserPostMessage(hwnd, WM_WAYLAND_MONITOR_CHANGED, 0, 0)) return;
+    if ((data = wayland_win_data_get(hwnd)))
+    {
+        data->monitor_change_pending = FALSE;
+        wayland_win_data_release(data);
+    }
+}
+
+static void post_monitor_changes(struct wl_array *hwnds)
+{
+    HWND *hwnd;
+
+    wl_array_for_each(hwnd, hwnds) wayland_post_monitor_change(*hwnd);
+    wl_array_release(hwnds);
+}
+
+/* Caller holds win_data_mutex. */
+static void collect_monitor_change(struct wl_array *hwnds, struct wayland_win_data *data)
+{
+    HWND hwnd, *slot;
+
+    if ((hwnd = wayland_win_data_mark_monitor_change(data)) && (slot = wl_array_add(hwnds, sizeof(*slot))))
+        *slot = hwnd;
+    else if (hwnd)
+        data->monitor_change_pending = FALSE;
 }
 
 void wayland_windows_update_monitors(void)
 {
     struct wayland_win_data *data;
+    struct wl_array hwnds;
 
+    wl_array_init(&hwnds);
     pthread_mutex_lock(&win_data_mutex);
     RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
-        wayland_win_data_post_monitor_change(data);
+        collect_monitor_change(&hwnds, data);
     pthread_mutex_unlock(&win_data_mutex);
+    post_monitor_changes(&hwnds);
 }
 
 /* A removed proxy can make a queued wl_surface.leave argument NULL. */
@@ -158,8 +197,10 @@ void wayland_windows_remove_output(uint32_t global_id)
 {
     struct wayland_win_data *data;
     struct wayland_surface *surface;
+    struct wl_array hwnds;
     uint32_t *id;
 
+    wl_array_init(&hwnds);
     pthread_mutex_lock(&win_data_mutex);
     RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
     {
@@ -169,11 +210,12 @@ void wayland_windows_remove_output(uint32_t global_id)
             if (*id != global_id) continue;
             memmove(id, id + 1, (char *)surface->entered_outputs.data + surface->entered_outputs.size - (char *)(id + 1));
             surface->entered_outputs.size -= sizeof(*id);
-            wayland_win_data_post_monitor_change(data);
+            collect_monitor_change(&hwnds, data);
             break;
         }
     }
     pthread_mutex_unlock(&win_data_mutex);
+    post_monitor_changes(&hwnds);
 }
 
 static void wayland_window_update_monitor(HWND hwnd)
