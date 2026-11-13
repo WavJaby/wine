@@ -204,6 +204,8 @@ static void output_info_array_populate(struct wl_array *output_info_array)
             if (process_wayland.auto_monitor_dpi && !info->output->has_logical_size)
             {
                 uint32_t scale = wayland_output_get_surface_scale(output->global_id);
+                /* Nothing learned in this wineserver session yet: start from the last scale seen on this output. */
+                if (!scale) scale = wayland_output_get_saved_scale(info->output->name);
                 info->output->learned_scale = scale;
                 if (scale)
                 {

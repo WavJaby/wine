@@ -405,6 +405,7 @@ BOOL wayland_output_set_work_size(uint32_t global_id, int width, int height);
 BOOL wayland_output_get_work_size(uint32_t global_id, int *width, int *height);
 BOOL wayland_output_update_monitor_dpi(uint32_t global_id, UINT dpi);
 uint32_t wayland_output_get_surface_scale(uint32_t global_id);
+uint32_t wayland_output_get_saved_scale(const char *output_name);
 
 /**********************************************************************
  *          Wayland surface

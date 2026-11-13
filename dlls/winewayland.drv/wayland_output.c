@@ -113,6 +113,101 @@ static void surface_scale_property(uint32_t global_id, WCHAR *name)
     for (i = 0; (name[i] = ascii[i]); ++i) continue;
 }
 
+/* The desktop property dies with the wineserver, and a sandboxed client may get no xdg-output (Hyprland 0.57 does not
+ * expose it inside a security context), so each cold start used to report the base DPI until a window learned the
+ * scale; a launcher that never pumps its queue never published it, and the next process drew at the base DPI.
+ * The last observed scale, keyed by output name, is kept in HKCU as the starting value; the first surface's fractional
+ * scale still corrects it. Upstream winex11.drv open_hkcu_key shape. */
+static HKEY open_scale_key(void)
+{
+    /* NtCreateKey creates one level only: Software\\Wine exists, the driver key may not */
+    static const char path[] = "\\Software\\Wine\\Wayland Driver";
+    DWORD_PTR sid_data[(sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE) / sizeof(DWORD_PTR)];
+    DWORD i, len = sizeof(sid_data);
+    UNICODE_STRING nameW;
+    OBJECT_ATTRIBUTES attr;
+    char buffer[256];
+    WCHAR bufferW[256];
+    HANDLE key;
+    SID *sid;
+
+    if (NtQueryInformationToken(GetCurrentThreadEffectiveToken(), TokenUser, sid_data, len, &len)) return 0;
+    sid = ((TOKEN_USER *)sid_data)->User.Sid;
+    len = snprintf(buffer, sizeof(buffer), "\\Registry\\User\\S-%u-%u", sid->Revision,
+                   MAKELONG(MAKEWORD(sid->IdentifierAuthority.Value[5], sid->IdentifierAuthority.Value[4]),
+                            MAKEWORD(sid->IdentifierAuthority.Value[3], sid->IdentifierAuthority.Value[2])));
+    for (i = 0; i < sid->SubAuthorityCount; i++)
+        len += snprintf(buffer + len, sizeof(buffer) - len, "-%u", sid->SubAuthority[i]);
+    len += snprintf(buffer + len, sizeof(buffer) - len, "%s", path);
+    for (i = 0; i < len; i++) bufferW[i] = buffer[i];
+
+    nameW.Buffer = bufferW;
+    nameW.Length = nameW.MaximumLength = len * sizeof(WCHAR);
+    InitializeObjectAttributes(&attr, &nameW, OBJ_CASE_INSENSITIVE, 0, NULL);
+    return NtCreateKey(&key, KEY_ALL_ACCESS, &attr, 0, NULL, 0, NULL) ? 0 : key;
+}
+
+static void output_name_value(const char *output_name, UNICODE_STRING *nameW, WCHAR *buffer, size_t size)
+{
+    static const char prefix[] = "OutputScale ";
+    size_t i, j;
+
+    for (i = 0; prefix[i] && i < size - 1; i++) buffer[i] = prefix[i];
+    for (j = 0; output_name[j] && i < size - 1; i++, j++) buffer[i] = (unsigned char)output_name[j];
+    buffer[i] = 0;
+    nameW->Buffer = buffer;
+    nameW->Length = nameW->MaximumLength = i * sizeof(WCHAR);
+}
+
+/* Caller holds process_wayland.output_mutex or owns the name. */
+uint32_t wayland_output_get_saved_scale(const char *output_name)
+{
+    char data[FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data[sizeof(DWORD)])];
+    KEY_VALUE_PARTIAL_INFORMATION *info = (void *)data;
+    UNICODE_STRING nameW;
+    WCHAR buffer[64];
+    uint32_t scale = 0;
+    ULONG size;
+    HKEY key;
+
+    if (!output_name || !(key = open_scale_key())) return 0;
+    output_name_value(output_name, &nameW, buffer, ARRAY_SIZE(buffer));
+    if (!NtQueryValueKey(key, &nameW, KeyValuePartialInformation, info, sizeof(data), &size) &&
+        info->Type == REG_DWORD && info->DataLength == sizeof(DWORD))
+        scale = *(DWORD *)info->Data;
+    NtClose(key);
+    return scale >= 60 && scale <= 960 ? scale : 0;
+}
+
+static void save_scale(uint32_t global_id, uint32_t scale)
+{
+    struct wayland_output *output;
+    UNICODE_STRING nameW;
+    WCHAR buffer[64] = {0};
+    DWORD value = scale;
+    HKEY key;
+
+    pthread_mutex_lock(&process_wayland.output_mutex);
+    wl_list_for_each(output, &process_wayland.output_list, link)
+    {
+        if (output->global_id != global_id || !output->current.name) continue;
+        output_name_value(output->current.name, &nameW, buffer, ARRAY_SIZE(buffer));
+        break;
+    }
+    pthread_mutex_unlock(&process_wayland.output_mutex);
+    if (!buffer[0]) return;
+    if (!(key = open_scale_key()))
+    {
+        WARN("cannot open the scale key\n");
+        return;
+    }
+    nameW.Buffer = buffer;
+    if (NtSetValueKey(key, &nameW, 0, REG_DWORD, &value, sizeof(value)))
+        WARN("failed to save scale %u for output %u\n", scale, global_id);
+    else TRACE("saved scale %u for output %s\n", scale, debugstr_wn(nameW.Buffer, nameW.Length / sizeof(WCHAR)));
+    NtClose(key);
+}
+
 uint32_t wayland_output_get_surface_scale(uint32_t global_id)
 {
     WCHAR name[64];
@@ -128,7 +223,9 @@ BOOL wayland_output_set_surface_scale(uint32_t global_id, uint32_t scale)
 
     if (scale < 60 || scale > 960 || scale == wayland_output_get_surface_scale(global_id)) return FALSE;
     surface_scale_property(global_id, name);
-    return NtUserSetProp(NtUserGetDesktopWindow(), name, ULongToHandle(scale));
+    if (!NtUserSetProp(NtUserGetDesktopWindow(), name, ULongToHandle(scale))) return FALSE;
+    save_scale(global_id, scale);
+    return TRUE;
 }
 
 /* Work area learned from a maximized configure: Wayland has no work-area protocol, but the size a compositor
