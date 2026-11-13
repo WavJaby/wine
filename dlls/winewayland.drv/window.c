@@ -235,7 +235,7 @@ static void wayland_window_update_monitor(HWND hwnd)
         surface->entered_outputs.size == sizeof(uint32_t))
     {
         output_id = *(uint32_t *)surface->entered_outputs.data;
-        if (surface->has_preferred_scale) scale = lround(surface->window.scale * 120.0);
+        if (surface->has_preferred_scale) scale = lround(surface->preferred_scale * 120.0);
     }
     wayland_win_data_release(data);
     if (!output_id) return; /* Do not guess the monitor of a spanning window. */
@@ -284,6 +284,7 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     DWORD style;
 
     conf->rect = data->rects.visible;
+    conf->raw_dpi = data->raw_dpi;
     style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
 
     TRACE("window=%s style=%#x\n", wine_dbgstr_rect(&conf->rect), style);
@@ -304,6 +305,8 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     }
 
     conf->resizeable = data->resizeable;
+    conf->min_track_size = data->min_track_size;
+    conf->max_track_size = data->max_track_size;
     conf->state = window_state;
     conf->visible = (style & WS_VISIBLE) == WS_VISIBLE;
     conf->managed = data->managed;
@@ -369,6 +372,8 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     /* If the window is a visible toplevel make it a wayland
      * xdg_toplevel. Otherwise keep it role-less to avoid polluting the
      * compositor with empty xdg_toplevels. */
+    wayland_win_data_get_config(data, &surface->window);
+    surface->window.scale = wayland_surface_get_render_scale(surface, surface->preferred_scale);
     switch (role)
     {
     case WAYLAND_SURFACE_ROLE_NONE:
@@ -386,6 +391,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
     }
 
     wayland_win_data_get_config(data, &surface->window);
+    surface->window.scale = wayland_surface_get_render_scale(surface, surface->preferred_scale);
 
     /* Size/position changes affect the effective pointer constraint, so update
      * it as needed. */
@@ -415,8 +421,7 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
         if (surface->window.state) surface->client_size_pending = FALSE;
         if (!surface->client_size_pending)
         {
-            xdg_toplevel_set_min_size(surface->xdg_toplevel, 0, 0);
-            xdg_toplevel_set_max_size(surface->xdg_toplevel, 0, 0);
+            wayland_surface_update_track_sizes(surface);
         }
         wayland_surface_request_client_size(surface);
 
@@ -663,6 +668,46 @@ static HWND pointing_input_window(void)
     return focused;
 }
 
+/* Application callbacks must run on the owning thread, outside driver locks.
+ * A handler may reposition its window, so suppress recursive queries. */
+static BOOL get_window_track_sizes(HWND hwnd, const struct window_rects *rects,
+                                   POINT *minimum, POINT *maximum)
+{
+    static __thread BOOL querying;
+    MINMAXINFO info = {0};
+    POINT default_max;
+    UINT context, dpi, raw_dpi;
+    int dx, dy;
+    BOOL ret;
+
+    if (querying || NtUserGetWindowThread(hwnd, NULL) != GetCurrentThreadId()) return FALSE;
+    context = NtUserSetThreadDpiAwarenessContext(NtUserGetWindowDpiAwarenessContext(hwnd));
+    dpi = NtUserGetDpiForWindow(hwnd);
+    raw_dpi = NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI);
+    default_max.x = NtUserGetSystemMetrics(SM_CXMAXTRACK);
+    default_max.y = NtUserGetSystemMetrics(SM_CYMAXTRACK);
+    querying = TRUE;
+    ret = NtUserCallHwndParam(hwnd, (UINT_PTR)&info, NtUserCallHwndParam_GetMinMaxInfo);
+    querying = FALSE;
+    NtUserSetThreadDpiAwarenessContext(context);
+    if (!ret || !dpi || !raw_dpi || info.ptMinTrackSize.x < 0 || info.ptMinTrackSize.y < 0 ||
+        info.ptMaxTrackSize.x < info.ptMinTrackSize.x || info.ptMaxTrackSize.y < info.ptMinTrackSize.y)
+        return FALSE;
+
+    dx = (rects->window.right - rects->window.left) - (rects->visible.right - rects->visible.left);
+    dy = (rects->window.bottom - rects->window.top) - (rects->visible.bottom - rects->visible.top);
+    minimum->x = max(0, (int)lround((double)info.ptMinTrackSize.x * raw_dpi / dpi) - dx);
+    minimum->y = max(0, (int)lround((double)info.ptMinTrackSize.y * raw_dpi / dpi) - dy);
+    /* Unchanged desktop maxima are defaults, not application constraints. */
+    maximum->x = info.ptMaxTrackSize.x == default_max.x ? 0 :
+        max(minimum->x, (int)lround((double)info.ptMaxTrackSize.x * raw_dpi / dpi) - dx);
+    maximum->y = info.ptMaxTrackSize.y == default_max.y ? 0 :
+        max(minimum->y, (int)lround((double)info.ptMaxTrackSize.y * raw_dpi / dpi) - dy);
+    TRACE("hwnd=%p min=%d,%d max=%d,%d dpi=%u raw=%u\n", hwnd,
+          minimum->x, minimum->y, maximum->x, maximum->y, dpi, raw_dpi);
+    return TRUE;
+}
+
 /***********************************************************************
  *           WAYLAND_WindowPosChanged
  */
@@ -673,6 +718,9 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     struct wayland_surface *owner_surface;
     struct wayland_win_data *data, *owner_data, *parent_data;
     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN, tool = FALSE, detached = FALSE, popup;
+    BOOL have_track_sizes = FALSE;
+    POINT min_track_size, max_track_size;
+    UINT raw_dpi = NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI);
 
     TRACE("hwnd %p new_rects %s after %p flags %08x\n", hwnd, debugstr_window_rects(new_rects), insert_after, swp_flags);
 
@@ -686,6 +734,9 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         if (is_menu_like_popup(hwnd)) detached = !(popup_anchor = pointing_input_window());
     }
     tool_parent = tool || detached ? find_toolwindow_parent(hwnd) : 0;
+    if (surface && managed && (swp_flags & WINE_SWP_RESIZABLE) &&
+        (!(swp_flags & SWP_NOSIZE) || (swp_flags & (SWP_SHOWWINDOW | SWP_FRAMECHANGED | SWP_STATECHANGED))))
+        have_track_sizes = get_window_track_sizes(hwnd, new_rects, &min_track_size, &max_track_size);
 
     if (!(data = wayland_win_data_get(hwnd))) return;
     /* A detached popup stays a toplevel. Once no longer the active window it reads as unmanaged, and became a
@@ -705,8 +756,14 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     owner_surface = owner_data ? owner_data->wayland_surface : NULL;
 
     data->rects = *new_rects;
+    data->raw_dpi = raw_dpi;
     data->is_fullscreen = fullscreen;
     data->resizeable = swp_flags & WINE_SWP_RESIZABLE;
+    if (have_track_sizes)
+    {
+        data->min_track_size = min_track_size;
+        data->max_track_size = max_track_size;
+    }
     data->managed = managed;
 
     if (!surface)
@@ -813,6 +870,9 @@ static void wayland_configure_window(HWND hwnd)
             return;
         }
         surface->client_size_pending = FALSE;
+        wayland_surface_update_track_sizes(surface);
+        wl_surface_commit(surface->wl_surface);
+        wl_display_flush(process_wayland.wl_display);
     }
 
     state = surface->processing.state;

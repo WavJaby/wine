@@ -86,6 +86,11 @@ static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_
         {
             TRACE("hwnd=%p acknowledging size-preserving configure %u\n", hwnd, serial);
             wayland_surface_ack_configure(surface, serial);
+            if (surface->client_size_pending && EqualRect(&surface->requested.rect, &surface->client_size_request))
+            {
+                surface->client_size_pending = FALSE;
+                wayland_surface_update_track_sizes(surface);
+            }
             wl_surface_commit(surface->wl_surface);
         }
     }
@@ -247,6 +252,19 @@ static const struct wl_surface_listener surface_listener =
     .leave = surface_handle_leave,
 };
 
+/* A preferred output scale does not mean existing Win32 pixels were redrawn
+ * at that DPI. Keep their density until WindowPosChanged supplies new raw
+ * rectangles. This also bitmap-scales system/unaware windows without requiring
+ * their GUI thread to pump a DPI notification. */
+double wayland_surface_get_render_scale(struct wayland_surface *surface, double preferred)
+{
+    UINT base = NtUserCallNoParam(NtUserCallNoParam_GetBaseDpi), raw = surface->window.raw_dpi;
+
+    if (preferred <= 0.0) preferred = 1.0;
+    if (!process_wayland.auto_monitor_dpi || !base || !raw || raw == lround(base * preferred)) return preferred;
+    return (double)raw / base;
+}
+
 void wp_fractional_scale_handle_scale(void* user_data,
                                       struct wp_fractional_scale_v1 *fractional_scale_v1,
                                       uint32_t scale_fixed)
@@ -265,6 +283,8 @@ void wp_fractional_scale_handle_scale(void* user_data,
         return;
     }
     surface->has_preferred_scale = TRUE;
+    surface->preferred_scale = scale;
+    scale = wayland_surface_get_render_scale(surface, scale);
     post = wayland_win_data_mark_monitor_change(data);
     if (scale == surface->window.scale)
     {
@@ -423,10 +443,48 @@ void wayland_surface_destroy(struct wayland_surface *surface)
     free(surface);
 }
 
+/* Persistent application bounds are independent of temporary size requests.
+ * Publish them before the mapping commit so fixed-size windows are not tiled. */
+static void wayland_surface_get_track_sizes(struct wayland_surface *surface, POINT *minimum, POINT *maximum,
+                                             int width, int height)
+{
+    if (!surface->window.resizeable)
+    {
+        minimum->x = maximum->x = width;
+        minimum->y = maximum->y = height;
+    }
+    else
+    {
+        minimum->x = lround(surface->window.min_track_size.x / surface->window.scale);
+        minimum->y = lround(surface->window.min_track_size.y / surface->window.scale);
+        maximum->x = surface->window.max_track_size.x ?
+            max(minimum->x, (int)lround(surface->window.max_track_size.x / surface->window.scale)) : 0;
+        maximum->y = surface->window.max_track_size.y ?
+            max(minimum->y, (int)lround(surface->window.max_track_size.y / surface->window.scale)) : 0;
+    }
+}
+
+static void wayland_surface_set_track_sizes(struct wayland_surface *surface, int width, int height)
+{
+    POINT minimum, maximum;
+
+    wayland_surface_get_track_sizes(surface, &minimum, &maximum, width, height);
+    xdg_toplevel_set_min_size(surface->xdg_toplevel, minimum.x, minimum.y);
+    xdg_toplevel_set_max_size(surface->xdg_toplevel, maximum.x, maximum.y);
+}
+
+void wayland_surface_update_track_sizes(struct wayland_surface *surface)
+{
+    RECT rect = map_rect_to_surface(surface, surface->window.rect);
+
+    wayland_surface_set_track_sizes(surface, rect.right - rect.left, rect.bottom - rect.top);
+}
+
 static void wayland_surface_init_fractional_scale(struct wayland_surface *surface,
                                                   double initial_scale)
 {
-    surface->window.scale = initial_scale;
+    surface->preferred_scale = initial_scale;
+    surface->window.scale = wayland_surface_get_render_scale(surface, initial_scale);
 
     if (!process_wayland.wp_fractional_scale_manager_v1) return;
 
@@ -486,6 +544,9 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface, const RECT *
     wayland_surface_init_fractional_scale(surface,
         process_wayland.wp_fractional_scale_manager_v1 ?
         wayland_output_get_initial_scale(window_rect) : 1.0);
+    wayland_surface_set_track_sizes(surface,
+        lround((window_rect->right - window_rect->left) / surface->window.scale),
+        lround((window_rect->bottom - window_rect->top) / surface->window.scale));
 
     wl_surface_commit(surface->wl_surface);
     wl_display_flush(process_wayland.wl_display);
@@ -551,7 +612,7 @@ void wayland_surface_make_popup(struct wayland_surface *surface, struct wayland_
     xdg_popup_add_listener(surface->xdg_popup, &xdg_popup_listener, surface->hwnd);
 
     surface->owner_hwnd = owner->hwnd;
-    wayland_surface_init_fractional_scale(surface, owner->window.scale);
+    wayland_surface_init_fractional_scale(surface, owner->preferred_scale);
 
     wl_surface_commit(surface->wl_surface);
     wl_display_flush(process_wayland.wl_display);
@@ -589,7 +650,7 @@ void wayland_surface_make_subsurface(struct wayland_surface *surface,
         goto err;
     }
 
-    wayland_surface_init_fractional_scale(surface, owner->window.scale);
+    wayland_surface_init_fractional_scale(surface, owner->preferred_scale);
 
     surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
     surface->owner_hwnd = owner->hwnd;
@@ -879,6 +940,9 @@ static void client_size_sync_done(void *data, struct wl_callback *callback, uint
                           wine_dbgstr_rect(&surface->processing.rect), surface->processing.processed,
                           wine_dbgstr_rect(&surface->client_size_request));
                     surface->client_size_pending = FALSE;
+                    wayland_surface_update_track_sizes(surface);
+                    wl_surface_commit(surface->wl_surface);
+                    wl_display_flush(process_wayland.wl_display);
                 }
                 else
                 {
@@ -899,6 +963,7 @@ static void client_size_sync_done(void *data, struct wl_callback *callback, uint
 void wayland_surface_request_client_size(struct wayland_surface *surface)
 {
     RECT rect;
+    POINT minimum, maximum;
     int width, height;
 
     /* Not before the initial configure: min == max on the mapping commit makes compositors (Hyprland) treat
@@ -910,6 +975,11 @@ void wayland_surface_request_client_size(struct wayland_surface *surface)
 
     rect = map_rect_to_surface(surface, surface->window.rect);
     OffsetRect(&rect, -rect.left, -rect.top);
+    wayland_surface_get_track_sizes(surface, &minimum, &maximum, rect.right, rect.bottom);
+    rect.right = max(rect.right, minimum.x);
+    rect.bottom = max(rect.bottom, minimum.y);
+    if (maximum.x) rect.right = min(rect.right, maximum.x);
+    if (maximum.y) rect.bottom = min(rect.bottom, maximum.y);
     /* A pending request can be older even when the new size matches the last
      * committed configure. Replace it so its eventual reply cannot undo a DPI resize. */
     if (IsRectEmpty(&rect) ||
@@ -985,16 +1055,7 @@ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface
             xdg_toplevel_set_max_size(surface->xdg_toplevel, surface->client_size_request.right,
                                       surface->client_size_request.bottom);
         }
-        else if (surface->window.resizeable)
-        {
-            xdg_toplevel_set_min_size(surface->xdg_toplevel, 0, 0);
-            xdg_toplevel_set_max_size(surface->xdg_toplevel, 0, 0);
-        }
-        else
-        {
-            xdg_toplevel_set_min_size(surface->xdg_toplevel, width, height);
-            xdg_toplevel_set_max_size(surface->xdg_toplevel, width, height);
-        }
+        else wayland_surface_set_track_sizes(surface, width, height);
     }
 }
 

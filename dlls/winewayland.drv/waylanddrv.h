@@ -298,10 +298,12 @@ struct wayland_window_config
     enum wayland_surface_config_state state;
     /* The scale (i.e., normalized dpi) the window is rendering at. */
     double scale;
+    UINT raw_dpi; /* DPI used to produce the cached Win32 window rectangles */
     BOOL visible;
     BOOL managed;
     BOOL minimized;
     BOOL resizeable;
+    POINT min_track_size, max_track_size; /* visible raw-pixel bounds; zero maximum is unrestricted */
 };
 
 struct wayland_client_surface
@@ -336,6 +338,7 @@ struct wayland_surface
     struct wl_surface *wl_surface;
     struct wl_array entered_outputs; /* Registry IDs, not output object pointers */
     BOOL has_preferred_scale;
+    double preferred_scale; /* compositor preference, independent of current Win32 render DPI */
     struct wp_viewport *wp_viewport;
     struct wp_fractional_scale_v1 *wp_fractional_scale_v1;
     struct wayland_shm_buffer *small_icon_buffer;
@@ -408,6 +411,8 @@ uint32_t wayland_output_get_surface_scale(uint32_t global_id);
  */
 
 struct wayland_surface *wayland_surface_create(HWND hwnd);
+double wayland_surface_get_render_scale(struct wayland_surface *surface, double preferred);
+void wayland_surface_update_track_sizes(struct wayland_surface *surface);
 void wayland_surface_destroy(struct wayland_surface *surface);
 void wayland_surface_make_toplevel(struct wayland_surface *surface, const RECT *window_rect);
 void wayland_surface_make_popup(struct wayland_surface *surface, struct wayland_surface *owner,
@@ -468,8 +473,10 @@ struct wayland_win_data
     struct wayland_client_surface *client_surface;
     /* window rects, relative to parent client area */
     struct window_rects rects;
+    UINT raw_dpi;
     BOOL is_fullscreen;
     BOOL resizeable;
+    POINT min_track_size, max_track_size; /* visible raw-pixel bounds; zero maximum is unrestricted */
     BOOL managed;
     BOOL layered_attribs_set;
     BOOL layered_lwa; /* layered through SetLayeredWindowAttributes: its non-layered surface carries the real content */

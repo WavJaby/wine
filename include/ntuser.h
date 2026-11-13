@@ -1433,6 +1433,7 @@ enum
     NtUserCallHwndParam_SetRawWindowPos,
     NtUserCallHwndParam_GetPrivateData,
     NtUserCallHwndParam_SetPrivateData,
+    NtUserCallHwndParam_GetMinMaxInfo,
 };
 
 struct get_window_rects_params

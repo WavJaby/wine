@@ -6502,6 +6502,10 @@ ULONG_PTR WINAPI NtUserCallHwndParam( HWND hwnd, DWORD_PTR param, DWORD code )
         return set_raw_window_pos( hwnd, params->rect, params->flags, params->internal );
     }
 
+    case NtUserCallHwndParam_GetMinMaxInfo:
+        *(MINMAXINFO *)param = get_min_max_info( hwnd );
+        return is_window( hwnd );
+
     case NtUserCallHwndParam_GetPrivateData:
     {
         struct get_private_data_params *params = (void *)param;
