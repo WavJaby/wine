@@ -322,11 +322,12 @@ static void wayland_add_device_gpu(const struct gdi_device_manager *device_manag
 static void wayland_add_device_source(const struct gdi_device_manager *device_manager,
                                        void *param, UINT state_flags, struct output_info *output_info)
 {
-    UINT dpi = NtUserGetSystemDpiForProcess( NULL );
+    UINT base_dpi = NtUserCallNoParam( NtUserCallNoParam_GetBaseDpi );
+    UINT dpi = base_dpi;
 
-    /* Experimental per-output effective DPI. Rendering scale and Win32 DPI
-     * remain separate values; do not multiply the configured Wine DPI again.
-     * Missing or rotated metadata must retain the existing system DPI. */
+    /* The configured system DPI is the user's base size at output scale 1.
+     * Apply the observed output scale once, independently of buffer scaling.
+     * Missing or rotated metadata must retain the configured base DPI. */
     if (process_wayland.auto_monitor_dpi && output_info->output->has_logical_size &&
         output_info->output->logical_w > 0 && output_info->output->logical_h > 0)
     {
@@ -334,12 +335,12 @@ static void wayland_add_device_source(const struct gdi_device_manager *device_ma
         double scale_y = (double)output_info->output->current_mode->height / output_info->output->logical_h;
 
         if (scale_x >= 0.5 && scale_x <= 8.0 && fabs(scale_x - scale_y) <= 0.01)
-            dpi = lround(96.0 * (scale_x + scale_y) / 2.0);
+            dpi = lround(base_dpi * (scale_x + scale_y) / 2.0);
     }
     else if (process_wayland.auto_monitor_dpi && output_info->output->learned_scale)
-        dpi = (output_info->output->learned_scale * 96 + 60) / 120;
-    TRACE("output=%s auto_dpi=%u dpi=%u metadata=%u\n", output_info->output->name,
-          process_wayland.auto_monitor_dpi, dpi, output_info->output->has_logical_size);
+        dpi = ((UINT64)output_info->output->learned_scale * base_dpi + 60) / 120;
+    TRACE("output=%s auto_dpi=%u base_dpi=%u dpi=%u metadata=%u\n", output_info->output->name,
+          process_wayland.auto_monitor_dpi, base_dpi, dpi, output_info->output->has_logical_size);
     TRACE("name=%s state_flags=0x%x\n",
           output_info->output->name, state_flags);
     device_manager->add_source(output_info->output->name, state_flags, dpi, param);

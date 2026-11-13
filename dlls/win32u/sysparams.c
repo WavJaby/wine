@@ -294,6 +294,9 @@ union sysparam_all_entry
 
 static const struct ratio no_dpi;
 UINT system_dpi;
+/* LogPixels: the user's size at output scale 1. A driver that scales per output multiplies this, not system_dpi,
+ * which latch_system_dpi_from_registry may set to the primary output's DPI. */
+static UINT base_dpi;
 static RECT work_area;
 static DWORD process_layout = ~0u;
 
@@ -2879,6 +2882,43 @@ void reset_monitor_update_serial(void)
     pthread_mutex_unlock( &display_lock );
 }
 
+static BOOL system_dpi_latched;
+static __thread BOOL display_lock_held; /* this thread took display_lock through lock_display_devices */
+
+/* Windows fixes a process's system DPI at the primary monitor's DPI and keeps it for the process lifetime;
+ * per-monitor-aware windows follow later changes through WM_DPICHANGED. Decided once, at the first query: user32
+ * caches it at process attach, so a later change would leave the process disagreeing with itself. Loading the display
+ * cache that early (driver included) breaks window creation, so only the primary source's Dpi that other processes of
+ * this session wrote is read; a session's first process finds none and keeps LogPixels.
+ * Apps that size their frame from system metrics while Wine draws it at the window DPI leaked part of the caption
+ * (LINE's media viewer: 16 px at 96 vs 154). A driver without per-output DPI leaves sources at LogPixels: no change. */
+static void latch_system_dpi_from_registry(void)
+{
+    struct source source;
+    char path[MAX_PATH];
+    unsigned int i;
+
+    if (system_dpi_latched || display_lock_held) return;
+    pthread_mutex_lock( &display_lock );
+    if (!system_dpi_latched && (video_key || (video_key = reg_open_ascii_key( NULL, devicemap_video_keyA ))))
+    {
+        system_dpi_latched = TRUE;
+        for (i = 0; i < 16; i++)
+        {
+            BOOL ok;
+            memset( &source, 0, sizeof(source) );
+            ok = read_source_from_registry( i, &source, path );
+            free( source.modes );
+            if (!ok || !(source.state_flags & DISPLAY_DEVICE_PRIMARY_DEVICE) || !source.dpi) continue;
+            if (source.dpi != system_dpi) TRACE( "system dpi %u -> registry primary source dpi %u\n", system_dpi, source.dpi );
+            system_dpi = source.dpi;
+            break;
+        }
+    }
+    system_dpi_latched = TRUE;
+    pthread_mutex_unlock( &display_lock );
+}
+
 static BOOL lock_display_devices( BOOL force )
 {
     static const WCHAR wine_service_station_name[] =
@@ -2896,6 +2936,7 @@ static BOOL lock_display_devices( BOOL force )
     init_display_driver(); /* make sure to load the driver before anything else */
 
     pthread_mutex_lock( &display_lock );
+    display_lock_held = TRUE;
 
     serial = get_monitor_update_serial();
     if (!force && monitor_update_serial >= serial) return TRUE;
@@ -2925,6 +2966,7 @@ static BOOL lock_display_devices( BOOL force )
     if (!ret)
     {
         ERR( "Failed to read display config.\n" );
+        display_lock_held = FALSE;
         pthread_mutex_unlock( &display_lock );
     }
     return ret;
@@ -2932,6 +2974,7 @@ static BOOL lock_display_devices( BOOL force )
 
 static void unlock_display_devices(void)
 {
+    display_lock_held = FALSE;
     pthread_mutex_unlock( &display_lock );
 }
 
@@ -3290,6 +3333,7 @@ struct ratio get_thread_dpi(void)
 UINT get_system_dpi(void)
 {
     DPI_AWARENESS awareness = NTUSER_DPI_CONTEXT_GET_AWARENESS( get_thread_dpi_awareness_context() );
+    latch_system_dpi_from_registry();
     if (awareness == DPI_AWARENESS_UNAWARE) return USER_DEFAULT_SCREEN_DPI;
     return system_dpi;
 }
@@ -4875,6 +4919,7 @@ ULONG WINAPI NtUserGetSystemDpiForProcess( HANDLE process )
         return 0;
     }
 
+    latch_system_dpi_from_registry();
     return system_dpi;
 }
 
@@ -6036,6 +6081,7 @@ void sysparams_init(void)
         }
     }
     if (!system_dpi) system_dpi = USER_DEFAULT_SCREEN_DPI;
+    base_dpi = system_dpi;
 
     /* FIXME: what do the DpiScalingVer flags mean? */
     get_dword_entry( (union sysparam_all_entry *)&entry_DPISCALINGVER, 0, &dpi_scaling, 0 );
@@ -7629,6 +7675,9 @@ ULONG_PTR WINAPI NtUserCallNoParam( ULONG code )
     case NtUserCallNoParam_DisplayModeChanged:
         display_mode_changed( FALSE );
         return TRUE;
+
+    case NtUserCallNoParam_GetBaseDpi:
+        return base_dpi;
 
     /* temporary exports */
     case NtUserExitingThread:

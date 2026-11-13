@@ -1084,6 +1084,8 @@ enum
     /* temporary exports */
     NtUserExitingThread,
     NtUserThreadDetach,
+    /* appended so earlier codes keep their values */
+    NtUserCallNoParam_GetBaseDpi,
 };
 
 static inline HWND NtUserGetDesktopWindow(void)
