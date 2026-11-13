@@ -1535,10 +1535,16 @@ failed:
  */
 RECT map_rect_to_surface(struct wayland_surface *surface, RECT rect)
 {
+    /* Size from the Win32 size, not from two separately rounded edges: a configure of L becomes round(L * scale)
+     * pixels, and only round(size / scale) maps that back to L for every origin (scale >= 1). Edge rounding lost a
+     * pixel at some window positions (1409x843 px at y=300 -> 526, not 527), and a maximized configure smaller than
+     * the window was never acknowledged. */
+    int width = rect.right - rect.left, height = rect.bottom - rect.top;
+
     rect.left = round(rect.left / surface->window.scale);
     rect.top  = round(rect.top / surface->window.scale);
-    rect.right = round(rect.right / surface->window.scale);
-    rect.bottom  = round(rect.bottom / surface->window.scale);
+    rect.right = rect.left + round(width / surface->window.scale);
+    rect.bottom  = rect.top + round(height / surface->window.scale);
     return rect;
 }
 
@@ -1561,10 +1567,13 @@ POINT map_point_to_surface(struct wayland_surface *surface, POINT point)
  */
 RECT map_rect_from_surface(struct wayland_surface *surface, RECT rect)
 {
+    /* Same split as map_rect_to_surface, so the two stay inverse for sizes. */
+    int width = rect.right - rect.left, height = rect.bottom - rect.top;
+
     rect.left = round(rect.left * surface->window.scale);
     rect.top  = round(rect.top * surface->window.scale);
-    rect.right = round(rect.right * surface->window.scale);
-    rect.bottom  = round(rect.bottom * surface->window.scale);
+    rect.right = rect.left + round(width * surface->window.scale);
+    rect.bottom  = rect.top + round(height * surface->window.scale);
     return rect;
 }
 
